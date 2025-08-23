@@ -596,12 +596,14 @@ class VwWeConnect {
                         this.getVehicles()
                             .then(() => {
                                 this.vinArray.forEach((vin) => {
-                                    this.getIdStatus(vin).catch((err) => {
-                                        this.log.error("get id status Failed");
-                                    });
-                                    this.getIdParkingPosition(vin).catch((err) => {
-                                        this.log.error("get id parking position Failed");
-                                    });
+                                    if (vin === this.currSession.vin) {
+                                        this.getIdStatus(vin).catch((err) => {
+                                            this.log.error("get id status Failed");
+                                        });
+                                        this.getIdParkingPosition(vin).catch((err) => {
+                                            this.log.error("get id parking position Failed");
+                                        });
+                                    }
                                 });
 
                                 this.updateInterval = setInterval(() => {
@@ -1075,7 +1077,7 @@ class VwWeConnect {
             "accept-language": "de-de",
         };
         if (this.type === "Wc") {
-            reject(err);
+            reject();
             return;
             method = "GET";
             url = "https://emea.bff.cariad.digital/user-identity/v1/identity/login?redirect_uri=wecharge://authenticated&code=" + jwtauth_code;
