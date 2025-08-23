@@ -596,14 +596,9 @@ class VwWeConnect {
                         this.getVehicles()
                             .then(() => {
                                 this.vinArray.forEach((vin) => {
-                                    if (vin === this.currSession.vin) {
-                                        this.getIdStatus(vin).catch((err) => {
-                                            this.log.error("get id status Failed");
-                                        });
-                                        this.getIdParkingPosition(vin).catch((err) => {
-                                            this.log.error("get id parking position Failed");
-                                        });
-                                    }
+                                    this.getIdStatus(vin).catch((err) => {
+                                         this.log.error("get id status Failed");
+                                    });
                                 });
 
                                 this.updateInterval = setInterval(() => {
