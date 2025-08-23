@@ -953,14 +953,15 @@ class VwWeConnect {
 
     updateStatus() {
         this.vinArray.forEach((vin) => {
-            this.getIdStatus(vin).catch((err) => {
-                this.log.error("get id status Failed");
-                this.refreshIDToken().catch((err) => { });
-            });
-            this.getIdParkingPosition(vin).catch((err) => {
-                this.log.error("get id parking position Failed");
-                this.refreshIDToken().catch((err) => { });
-            });
+            if (vin === this.currSession.vin) {
+                this.getIdStatus(vin).catch((err) => {
+                    this.log.error("get id status Failed");
+                    this.refreshIDToken().catch((err) => { });
+                });
+                this.getIdParkingPosition(vin).catch((err) => {
+                    this.log.error("get id parking position Failed");
+                });
+            }
             //this.getWcData();
         });
         return;
