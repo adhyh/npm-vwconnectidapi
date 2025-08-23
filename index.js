@@ -1782,9 +1782,13 @@ class VwWeConnect {
 
     getIdParkingPosition(vin) {
         if (!this.hasParkingPosition(vin)) {
-            this.log.debug(`VIN ${vin} doesn't have parkingPosition capability`);
-            return;
+            this.log.debug(`VIN ${vin} has no parkingPosition capability`);
+            return Promise.resolve(null); // altijd een Promise
         }
+  
+        //if (this.currSession && vin !== this.currSession.vin) {
+        //   return Promise.resolve(null);
+        //}
         return new Promise((resolve, reject) => {
             this.log.debug("START getIdParkingPosition");
             request.get(
