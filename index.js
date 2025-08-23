@@ -1781,6 +1781,10 @@ class VwWeConnect {
     }
 
     getIdParkingPosition(vin) {
+        if (!this.hasParkingPosition(vin)) {
+            this.log.debug(`VIN ${vin} doesn't have parkingPosition capability`);
+            return;
+        }
         return new Promise((resolve, reject) => {
             this.log.debug("START getIdParkingPosition");
             request.get(
@@ -2620,6 +2624,12 @@ class VwWeConnect {
                 }
             );
         });
+    }
+
+    hasParkingPosition(vin) {
+        const vehicle = this.vehicles.find(v => v.vin === vin);
+        if (!vehicle) return false;
+        return vehicle.capabilities.some(c => c.id === "parkingPosition");
     }
 
     setVehicleStatusv2(vin, url, body, contentType, secToken) {
