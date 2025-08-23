@@ -2627,9 +2627,13 @@ class VwWeConnect {
     }
 
     hasParkingPosition(vin) {
-        const vehicle = this.vehicles.find(v => v.vin === vin);
-        if (!vehicle) return false;
-        return vehicle.capabilities.some(c => c.id === "parkingPosition");
+        const list = Array.isArray(this.vehicles) ? this.vehicles : (this.vehicles && Array.isArray(this.vehicles.data) ? this.vehicles.data : []);
+        if (!Array.isArray(list)) return false;
+
+        const vehicle = list.find(v => v && v.vin === vin);
+        if (!vehicle || !Array.isArray(vehicle.capabilities)) return false;
+
+        return vehicle.capabilities.some(c => c && c.id === "parkingPosition");
     }
 
     setVehicleStatusv2(vin, url, body, contentType, secToken) {
