@@ -9,6 +9,7 @@ const { Crypto } = require("@peculiar/webcrypto");
 const { v4: uuidv4 } = require("uuid");
 const traverse = require("traverse");
 const express = require('express');
+const mysql = require('mysql2');
 
 module.exports.idStatusEmitter = new EventEmitter();
 module.exports.idLogEmitter = new EventEmitter();
@@ -88,7 +89,8 @@ class VwWeConnect {
         pendingRequests: 0,
         historyLimit: 100,
         chargerOnly: false,
-        backendError: false
+        backendError: false,
+        databaseIP: ""
     }
 
     currSession = {
