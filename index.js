@@ -90,7 +90,6 @@ class VwWeConnect {
         historyLimit: 100,
         chargerOnly: false,
         backendError: false,
-        databaseIP: ""
     }
 
     currSession = {
@@ -220,6 +219,17 @@ class VwWeConnect {
         } else {
             this.log.error("VIN <" + pVin + "> is unknown. Active VIN is still <" + this.currSession.vin + ">.");
         }
+    }
+
+    setDatabase(pHost) {
+        this.config.db = mysql.createPool({
+          host: pHost,      // your MySQL host
+          user: this.config.user,         // your DB username
+          password: this.config.password, // your DB password
+          database: 'weconnect',       // your DB name
+          waitForConnections: true,
+          connectionLimit: 10,
+});
     }
 
     restart() {
@@ -1604,6 +1614,20 @@ class VwWeConnect {
         });
     }
 
+    async logToDb(odo, soc, range, lat = null, lon = null) {
+      const sql = `INSERT INTO travel (vin, odo, soc, range, lat, lon)
+                   VALUES (?, ?, ?, ?, ?, ?)`;
+      const [result] = await db.execute(sql, [
+        this.currSession.vin,
+        odo,
+        soc,
+        range,
+        lat,
+        lon
+      ]);
+      return result.insertId;
+    }
+    
     runEventEmitters() {
         module.exports.idStatusEmitter.emit('eventRunStarted');
         if (typeof (this.idDataOld) == "undefined") {
@@ -1614,8 +1638,35 @@ class VwWeConnect {
             // parking
             if (this.idData.parking.data.carIsParked != this.idDataOld.parking.data.carIsParked) {
                 if (this.idData.parking.data.carIsParked) {
+                     (async () => {
+                          try {
+                            const odo = Number(this.idData?.status?.vehicleStatus?.value?.odometer ?? null);
+                            const soc = Number(this.idData?.charging?.batteryStatus?.value?.currentSOC_pct ?? null);
+                            const rng = Number(this.idData?.charging?.batteryStatus?.value?.cruisingRangeElectric_km ?? null);
+                            const lat = this.idParkingPosition?.data?.lat ?? null;
+                            const lon = this.idParkingPosition?.data?.lon ?? null;
+                
+                            const id = await this.logToDb(odo, soc, rng, lat, lon);
+                          } catch (err) {
+                            console.error('DB error:', err);
+                          }
+                        })();
+                    
                     module.exports.idStatusEmitter.emit('positionUpdate', this.idData.parking.data);
+                    
                 } else {
+                    (async () => {
+                          try {
+                            const odo = Number(this.idData?.status?.vehicleStatus?.value?.odometer ?? null);
+                            const soc = Number(this.idData?.charging?.batteryStatus?.value?.currentSOC_pct ?? null);
+                            const rng = Number(this.idData?.charging?.batteryStatus?.value?.cruisingRangeElectric_km ?? null);
+                
+                            const id = await this.logToDb(odo, soc, rng);
+                          } catch (err) {
+                            console.error('DB error:', err);
+                          }
+                        })();
+                    
                     module.exports.idStatusEmitter.emit('positionUnknown');
                 }
                 module.exports.idStatusEmitter.emit('parked', this.idData.parking.data.carIsParked);
