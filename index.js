@@ -1638,7 +1638,8 @@ class VwWeConnect {
             // parking
             if (this.idData.parking.data.carIsParked != this.idDataOld.parking.data.carIsParked) {
                 if (this.idData.parking.data.carIsParked) {
-                     (async () => {
+                     if (this.config.db) {
+                         (async () => {
                           try {
                             const odo = Number(this.idData?.status?.vehicleStatus?.value?.odometer ?? null);
                             const soc = Number(this.idData?.charging?.batteryStatus?.value?.currentSOC_pct ?? null);
@@ -1651,10 +1652,12 @@ class VwWeConnect {
                             console.error('DB error:', err);
                           }
                         })();
+                     }
                     
                     module.exports.idStatusEmitter.emit('positionUpdate', this.idData.parking.data);
                     
                 } else {
+                    if (this.config.db) {
                     (async () => {
                           try {
                             const odo = Number(this.idData?.status?.vehicleStatus?.value?.odometer ?? null);
@@ -1666,6 +1669,7 @@ class VwWeConnect {
                             console.error('DB error:', err);
                           }
                         })();
+                    }
                     
                     module.exports.idStatusEmitter.emit('positionUnknown');
                 }
