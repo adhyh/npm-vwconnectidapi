@@ -1641,7 +1641,7 @@ class VwWeConnect {
                      if (this.config.db) {
                          (async () => {
                           try {
-                            const odo = Number(this.idData?.status?.vehicleStatus?.value?.odometer ?? null);
+                            const odo = Number(this.idData?.measurements?.odometerStatus?.value?.odometer ?? null);
                             const soc = Number(this.idData?.charging?.batteryStatus?.value?.currentSOC_pct ?? null);
                             const rng = Number(this.idData?.charging?.batteryStatus?.value?.cruisingRangeElectric_km ?? null);
                             const lat = this.idParkingPosition?.data?.lat ?? null;
