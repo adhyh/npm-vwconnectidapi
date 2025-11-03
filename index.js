@@ -1614,16 +1614,17 @@ class VwWeConnect {
         });
     }
 
-    async logToDb(odo, soc, range, lat = null, lon = null) {
-      const sql = `INSERT INTO travel (vin, odo, soc, range, lat, lon)
+    async logToDb(odo, soc, rng, lat = null, lon = null) {
+      const sql = `INSERT INTO travel (vin, odo, soc, \`range\`, lat, lon)
                    VALUES (?, ?, ?, ?, ?, ?)`;
-      const [result] = await db.execute(sql, [
-        this.currSession.vin,
-        odo,
-        soc,
-        range,
-        lat,
-        lon
+      const toNum = v => (Number.isFinite(Numer(v)) ? Number(v) : null);
+      const [result] = await this.config.db.promise().execute(sql, [
+        this.currSession?.vin ?? null,
+        toNum(odo),
+        toNum(soc),
+        toNum(rng),
+        toNum(lat),
+        toNum(lon)
       ]);
       return result.insertId;
     }
