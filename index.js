@@ -1651,7 +1651,7 @@ class VwWeConnect {
       }
     }
     
-    runEventEmitters() {
+    async runEventEmitters() {
         module.exports.idStatusEmitter.emit('eventRunStarted');
         if (typeof (this.idDataOld) == "undefined") {
             return;
