@@ -216,6 +216,8 @@ class VwWeConnect {
         if (this.vinArray.includes(pVin)) {
             this.currSession.vin = pVin;
             this.log.info("Active VIN successfully set to <" + this.currSession.vin + ">.");
+            this.setDatabase('10.55.0.1');
+            this.log.info("database set");
         } else {
             this.log.error("VIN <" + pVin + "> is unknown. Active VIN is still <" + this.currSession.vin + ">.");
         }
@@ -626,6 +628,8 @@ class VwWeConnect {
                         this.log.error("get personal data Failed");
                     });
             })
+
+
             .catch((err) => {
                 this.log.error("Login Failed");
             });
@@ -634,345 +638,324 @@ class VwWeConnect {
         this.log.debug("getData END");
     }
 
-    login() {
-        return new Promise(async (resolve, reject) => {
-            const nonce = this.getNonce();
-            const state = uuidv4();
 
-            let [code_verifier, codeChallenge] = this.getCodeChallenge();
 
-            const method = "GET";
-            const form = {};
-            let url =
-                "https://identity.vwgroup.io/oidc/v1/authorize?client_id=" +
-                this.clientId +
-                "&scope=" +
-                this.scope +
-                "&response_type=" +
-                this.responseType +
-                "&redirect_uri=" +
-                this.redirect +
-                "&nonce=" +
-                nonce +
-                "&state=" +
-                state;
-
-            if (this.config.type === "id" && this.type !== "Wc") {
-                url = await this.receiveLoginUrl().catch((err) => {
-                    this.log.warn("Failed to get login url");
-                });
-                if (!url) {
-                    url = "https://emea.bff.cariad.digital/user-login/v1/authorize?nonce=" + this.randomString(16) + "&redirect_uri=weconnect://authenticated";
-                }
-            }
-            const loginRequest = request(
-                {
-                    method: method,
-                    url: url,
-                    headers: {
-                        "User-Agent": this.userAgent,
-                        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Accept-Encoding": "gzip, deflate",
-                        "x-requested-with": this.xrequest,
-                        "upgrade-insecure-requests": 1,
-                    },
-                    jar: this.jar,
-                    form: form,
-                    gzip: true,
-                    followAllRedirects: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        if (this.type === "Wc") {
-                            if (err && err.message === "Invalid protocol: wecharge:") {
-                                this.log.debug("Found WeCharge connection");
-                                this.getTokens(loginRequest, code_verifier, reject, resolve);
-                            } else {
-                                this.log.debug("No WeCharge found, cancel login");
-                                resolve();
-                            }
-                            return;
-                        }
-                        if (err && err.message.indexOf("Invalid protocol:") !== -1) {
-                            this.log.debug("Found Token");
-                            this.getTokens(loginRequest, code_verifier, reject, resolve);
-                            return;
-                        }
-                        this.log.error("Failed in first login step ");
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        body && this.log.error(JSON.stringify(body));
-                        err && err.message && this.log.error(err.message);
-
-                        loginRequest && loginRequest.uri && loginRequest.uri.query && this.log.debug(loginRequest.uri.query.toString());
-
-                        reject(err);
-                        return;
-                    }
-
-                    try {
-                        let form = {};
-                        if (body.indexOf("emailPasswordForm") !== -1) {
-                            this.log.debug("parseEmailForm");
-                            form = this.extractHidden(body);
-                            form["email"] = this.config.user;
-                        } else {
-                            this.log.error("No Login Form found for type: " + this.type);
-                            this.log.debug(JSON.stringify(body));
-                            reject(err);
-                            return;
-                        }
-                        request.post(
-                            {
-                                url: "https://identity.vwgroup.io/signin-service/v1/" + this.clientId + "/login/identifier",
-                                headers: {
-                                    "Content-Type": "application/x-www-form-urlencoded",
-                                    "User-Agent": this.userAgent,
-                                    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                    "Accept-Language": "en-US,en;q=0.9",
-                                    "Accept-Encoding": "gzip, deflate",
-                                    "x-requested-with": this.xrequest,
-                                },
-                                form: form,
-                                jar: this.jar,
-                                gzip: true,
-                                followAllRedirects: true,
-                            },
-                            (err, resp, body) => {
-                                if (err || (resp && resp.statusCode >= 400)) {
-                                    this.log.error("Failed to get login identifier");
-                                    err && this.log.error(err);
-                                    resp && this.log.error(resp.statusCode.toString());
-                                    body && this.log.error(JSON.stringify(body));
-                                    reject(err);
-                                    return;
-                                }
-                                try {
-                                    if (body.indexOf("emailPasswordForm") !== -1) {
-                                        this.log.debug("emailPasswordForm2");
-                                        /*
-                                        const stringJson =body.split("window._IDK = ")[1].split(";")[0].replace(/\n/g, "")
-                                        const json =stringJson.replace(/(['"])?([a-z0-9A-Z_]+)(['"])?:/g, '"$2": ').replace(/'/g, '"')
-                                        const jsonObj = JSON.parse(json);
-                                        */
-                                        form = {
-                                            _csrf: body.split("csrf_token: '")[1].split("'")[0],
-                                            email: this.config.user,
-                                            password: this.config.password,
-                                            hmac: body.split('"hmac":"')[1].split('"')[0],
-                                            relayState: body.split('"relayState":"')[1].split('"')[0],
-                                        };
-                                    } else {
-                                        this.log.error("No Login Form found. Please check your E-Mail in the app.");
-                                        this.log.debug(JSON.stringify(body));
-                                        reject(err);
-                                        return;
-                                    }
-                                    request.post(
-                                        {
-                                            url: "https://identity.vwgroup.io/signin-service/v1/" + this.clientId + "/login/authenticate",
-                                            headers: {
-                                                "Content-Type": "application/x-www-form-urlencoded",
-                                                "User-Agent": this.userAgent,
-                                                Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                "Accept-Language": "en-US,en;q=0.9",
-                                                "Accept-Encoding": "gzip, deflate",
-                                                "x-requested-with": this.xrequest,
-                                            },
-                                            form: form,
-                                            jar: this.jar,
-                                            gzip: true,
-                                            followAllRedirects: false,
-                                        },
-                                        (err, resp, body) => {
-                                            if (err || (resp && resp.statusCode >= 400)) {
-                                                this.log.error("Failed to get login authenticate");
-                                                err && this.log.error(err);
-                                                resp && this.log.error(resp.statusCode.toString());
-                                                body && this.log.error(JSON.stringify(body));
-                                                reject(err);
-                                                return;
-                                            }
-
-                                            try {
-                                                this.log.debug(JSON.stringify(body));
-                                                this.log.debug(JSON.stringify(resp.headers));
-
-                                                if (resp.headers.location.split("&").length <= 2 || resp.headers.location.indexOf("/terms-and-conditions?") !== -1) {
-                                                    this.log.warn(resp.headers.location);
-                                                    this.log.warn("No valid userid, please visit this link or logout and login in your app account:");
-                                                    this.log.warn("https://" + resp.request.host + resp.headers.location);
-                                                    this.log.warn("Try to auto accept new consent");
-
-                                                    request.get(
-                                                        {
-                                                            url: "https://" + resp.request.host + resp.headers.location,
-                                                            jar: this.jar,
-                                                            headers: {
-                                                                "User-Agent": this.userAgent,
-                                                                Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                                "Accept-Language": "en-US,en;q=0.9",
-                                                                "Accept-Encoding": "gzip, deflate",
-                                                                "x-requested-with": this.xrequest,
-                                                            },
-                                                            followAllRedirects: true,
-                                                            gzip: true,
-                                                        },
-                                                        (err, resp, body) => {
-                                                            this.log.debug(body);
-
-                                                            const form = this.extractHidden(body);
-                                                            const url = "https://" + resp.request.host + resp.req.path.split("?")[0];
-                                                            this.log.debug(JSON.stringify(form));
-
-                                                            request.post(
-                                                                {
-                                                                    url: url,
-                                                                    jar: this.jar,
-                                                                    headers: {
-                                                                        "Content-Type": "application/x-www-form-urlencoded",
-                                                                        "User-Agent": this.userAgent,
-                                                                        Accept:
-                                                                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                                        "Accept-Language": "en-US,en;q=0.9",
-                                                                        "Accept-Encoding": "gzip, deflate",
-                                                                        "x-requested-with": this.xrequest,
-                                                                    },
-                                                                    form: form,
-                                                                    followAllRedirects: true,
-                                                                    gzip: true,
-                                                                },
-                                                                (err, resp, body) => {
-                                                                    if ((err && err.message.indexOf("Invalid protocol:") !== -1) || (resp && resp.statusCode >= 400)) {
-                                                                        this.log.warn("Failed to auto accept");
-                                                                        err && this.log.error(err);
-                                                                        resp && this.log.error(resp.statusCode.toString());
-                                                                        body && this.log.error(JSON.stringify(body));
-                                                                        reject(err);
-                                                                        return;
-                                                                    }
-                                                                    this.log.info("Auto accept succesful. Restart adapter in 10sec");
-                                                                    setTimeout(() => {
-                                                                        this.restart();
-                                                                    }, 10 * 1000);
-                                                                }
-                                                            );
-                                                        }
-                                                    );
-
-                                                    reject(err);
-                                                    return;
-                                                }
-                                                this.config.userid = resp.headers.location.split("&")[2].split("=")[1];
-                                                if (!this.stringIsAValidUrl(resp.headers.location)) {
-                                                    if (resp.headers.location.indexOf("&error=") !== -1) {
-                                                        const location = resp.headers.location;
-                                                        this.log.error("Error: " + location.substring(location.indexOf("error="), location.length - 1));
-                                                    } else {
-                                                        this.log.error("No valid login url, please download the log and visit:");
-                                                        this.log.error("http://" + resp.request.host + resp.headers.location);
-                                                    }
-                                                    reject(err);
-                                                    return;
-                                                }
-
-                                                let getRequest = request.get(
-                                                    {
-                                                        url: resp.headers.location || "",
-                                                        headers: {
-                                                            "User-Agent": this.userAgent,
-                                                            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                            "Accept-Language": "en-US,en;q=0.9",
-                                                            "Accept-Encoding": "gzip, deflate",
-                                                            "x-requested-with": this.xrequest,
-                                                        },
-                                                        jar: this.jar,
-                                                        gzip: true,
-                                                        followAllRedirects: true,
-                                                    },
-                                                    (err, resp, body) => {
-                                                        if (err) {
-                                                            this.log.debug(err);
-                                                            this.getTokens(getRequest, code_verifier, reject, resolve);
-                                                        } else {
-                                                            this.log.debug(body);
-                                                            this.log.debug("No Token received visiting url and accept the permissions.");
-                                                            const form = this.extractHidden(body);
-                                                            getRequest = request.post(
-                                                                {
-                                                                    url: getRequest.uri.href,
-                                                                    headers: {
-                                                                        "Content-Type": "application/x-www-form-urlencoded",
-                                                                        "User-Agent": this.userAgent,
-                                                                        Accept:
-                                                                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                                        "Accept-Language": "en-US,en;q=0.9",
-                                                                        "Accept-Encoding": "gzip, deflate",
-                                                                        "x-requested-with": this.xrequest,
-                                                                        referer: getRequest.uri.href,
-                                                                    },
-                                                                    form: form,
-                                                                    jar: this.jar,
-                                                                    gzip: true,
-                                                                    followAllRedirects: true,
-                                                                },
-                                                                (err, resp, body) => {
-                                                                    if (err) {
-                                                                        this.getTokens(getRequest, code_verifier, reject, resolve);
-                                                                    } else {
-                                                                        this.log.error("No Token received. Please try to logout and login in the VW app or select type VWv2 in the settings");
-                                                                        try {
-                                                                            this.log.debug(JSON.stringify(body));
-                                                                        } catch (err) {
-                                                                            this.log.error(err);
-                                                                            reject(err);
-                                                                        }
-                                                                    }
-                                                                }
-                                                            );
-                                                        }
-                                                    }
-                                                );
-                                            } catch (err2) {
-                                                this.log.error("Login was not successful, please check your login credentials and selected type");
-                                                err && this.log.error(err);
-                                                this.log.error(err2);
-                                                this.log.error(err2.stack);
-                                                reject(err);
-                                            }
-                                        }
-                                    );
-                                } catch (err) {
-                                    this.log.error(err);
-                                    reject(err);
-                                }
-                            }
-                        );
-                    } catch (err) {
-                        this.log.error(err);
-                        reject(err);
-                    }
-                }
-            );
+_req(opts) {
+    return new Promise((resolve, reject) => {
+        request(opts, (err, resp, body) => {
+            if (err) return reject(err);
+            resolve({ resp, body });
         });
+    });
+}
+
+
+async _handleNewAuthFlow(startUrl, jar) {
+    const adapter = this;
+    const ua = this.userAgent || "Volkswagen/3.51.1-android/14";
+
+    let url = startUrl;
+    let resp, body;
+
+    // === Initial fetch of authorization page (max 5 redirects) ===
+    let maxInitialRedirects = 5;
+    while (maxInitialRedirects > 0) {
+        // If we already got a custom scheme, just return it
+        if (url.startsWith("weconnect://")) {
+            adapter.log.info("[WeConnect] [_handleNewAuthFlow] Found custom scheme during initial fetch → " + url);
+            return url;
+        }
+
+        adapter.log.debug("[WeConnect] [_handleNewAuthFlow] GET " + url);
+
+        ({ resp, body } = await this._req({
+            method: "GET",
+            url,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate"
+            }
+        }));
+
+        const status = resp.statusCode;
+
+        if (status === 200) {
+            break;
+        }
+
+        if (status === 302 || status === 303) {
+            const loc = resp.headers.location;
+            if (!loc) {
+                throw new Error("Forwarding without Location in headers (initial auth fetch)");
+            }
+            url = new URL(loc, url).toString();
+            maxInitialRedirects--;
+            continue;
+        }
+
+        throw new Error("Failed to fetch authorization page, status=" + status);
     }
 
-    updateStatus() {
-        this.vinArray.forEach((vin) => {
-            if (vin === this.currSession.vin) {
-                this.getIdStatus(vin).catch((err) => {
-                    this.log.error("get id status Failed");
-                    this.refreshIDToken().catch((err) => { });
-                });
-                this.getIdParkingPosition(vin).catch((err) => {
-                    this.log.error("get id parking position Failed");
-                });
-            }
-            //this.getWcData();
-        });
-        return;
+    if (maxInitialRedirects === 0) {
+        throw new Error("Too many redirects while fetching authorization page");
     }
+
+    // === Extract state token from HTML ===
+    const stateMatch = body && body.match(/<input[^>]*name="state"[^>]*value="([^"]*)"/);
+    const state = stateMatch && stateMatch[1];
+    if (!state) {
+        throw new Error("Could not find state token in authorization page");
+    }
+
+    // === POST username/password/state to /u/login?state=... ===
+    const loginUrl = "https://identity.vwgroup.io/u/login?state=" + encodeURIComponent(state);
+    const loginFormBody =
+        "username=" + encodeURIComponent(this.config.user) +
+        "&password=" + encodeURIComponent(this.config.password) +
+        "&state=" + encodeURIComponent(state);
+
+    adapter.log.info("[WeConnect] [_handleNewAuthFlow] POST credentials → " + loginUrl);
+
+    ({ resp, body } = await this._req({
+        method: "POST",
+        url: loginUrl,
+        jar,
+        followRedirect: false,
+        gzip: true,
+        headers: {
+            "User-Agent": ua,
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate"
+        },
+        body: loginFormBody
+    }));
+
+    const statusLogin = resp.statusCode;
+    if (!(statusLogin === 302 || statusLogin === 303)) {
+        throw new Error("Login failed with status code: " + statusLogin);
+    }
+    if (!resp.headers.location) {
+        throw new Error("No Location header in login response");
+    }
+
+    let redirectUrl = resp.headers.location;
+    adapter.log.info("[WeConnect] [_handleNewAuthFlow] After-login redirect → " + redirectUrl);
+
+    // === Follow redirects until weconnect://authenticated... (max 10 redirects) ===
+    let maxDepth = 10;
+    while (maxDepth > 0) {
+        adapter.log.debug("[WeConnect] [_handleNewAuthFlow] Redirect loop depth=" + maxDepth +
+            " url=" + redirectUrl);
+
+        // Final callbacks
+        if (redirectUrl.startsWith("weconnect://authenticated")) {
+            adapter.log.info("[WeConnect] [_handleNewAuthFlow] Reached OAuth callback URL");
+            return redirectUrl;
+        }
+        if (redirectUrl.startsWith("weconnect://")) {
+            adapter.log.info("[WeConnect] [_handleNewAuthFlow] Found custom scheme URL → " + redirectUrl);
+            return redirectUrl;
+        }
+
+        const absUrl = redirectUrl.startsWith("http")
+            ? redirectUrl
+            : "https://identity.vwgroup.io" + redirectUrl;
+
+        ({ resp, body } = await this._req({
+            method: "GET",
+            url: absUrl,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": ua,
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate"
+            }
+        }));
+
+        const status = resp.statusCode;
+        if (status === 500) {
+            throw new Error("Temporary server error during new auth flow");
+        }
+        if (!resp.headers.location) {
+            throw new Error("No Location header in redirect (new auth flow), status=" + status);
+        }
+
+        redirectUrl = resp.headers.location;
+        maxDepth--;
+    }
+
+    throw new Error("Too many redirects in new auth flow");
+}
+
+
+async login() {
+    const jar = request.jar();
+    this._jar = jar;
+    const adapter = this;
+
+    //
+    // STEP 1 — BFF authorize (like WeConnectSession.authorizationUrl)
+    //
+    const nonce = Math.random().toString(36).slice(2);
+    const authorizeInit =
+        "https://emea.bff.cariad.digital/user-login/v1/authorize" +
+        "?nonce=" + encodeURIComponent(nonce) +
+        "&redirect_uri=" + encodeURIComponent("weconnect://authenticated");
+
+    this.log.info("[WeConnect] Step 1: GET authorize → " + authorizeInit);
+
+    let { resp } = await this._req({
+        method: "GET",
+        url: authorizeInit,
+        jar,
+        followRedirect: false,
+        gzip: true
+    });
+
+    if (!resp.headers.location) {
+        throw new Error("Missing Location header from BFF authorize");
+    }
+
+    const firstRedirect = resp.headers.location;
+    this.log.info("[WeConnect] Step 2: First redirect → " + firstRedirect);
+
+    //
+    // STEP 2 — New auth flow (Python: _handle_new_auth_flow)
+    //
+    const callbackUrl = await this._handleNewAuthFlow(firstRedirect, jar);
+
+    if (!callbackUrl || !callbackUrl.startsWith("weconnect://")) {
+        this.log.error("[WeConnect] Unexpected callback URL: " + callbackUrl);
+        throw new Error("Unexpected callback URL");
+    }
+
+    this.log.info("[WeConnect] Step 3: Final redirect reached → " + callbackUrl);
+
+    //
+    // STEP 3 — Transform custom scheme like Python + parse params
+    //
+    function makeHttpFromCustomScheme(cbUrl) {
+        const hashIdx = cbUrl.indexOf("#");
+        const qIdx = cbUrl.indexOf("?");
+
+        let qs = "";
+        if (hashIdx >= 0) {
+            qs = cbUrl.substring(hashIdx + 1);
+        } else if (qIdx >= 0) {
+            qs = cbUrl.substring(qIdx + 1);
+        } else {
+            return null;
+        }
+        return "https://egal?" + qs;
+    }
+
+    const httpUrl = makeHttpFromCustomScheme(callbackUrl);
+    if (!httpUrl) {
+        adapter.log.error("[WeConnect] Callback URL has no query/fragment: " + callbackUrl);
+        throw new Error("Callback URL has no parameters");
+    }
+
+    this.log.debug("[WeConnect] Transformed callback URL → " + httpUrl);
+
+    let urlObj;
+    try {
+        urlObj = new URL(httpUrl);
+    } catch (e) {
+        this.log.error("[WeConnect] Failed to parse transformed callback URL:");
+        this.log.error(httpUrl);
+        throw e;
+    }
+
+    const params = urlObj.searchParams;
+    const code          = params.get("code");
+    const id_token      = params.get("id_token");
+    const access_token  = params.get("access_token");
+    const state         = params.get("state");
+
+    if (!code || !id_token || !access_token || !state) {
+        this.log.error("[WeConnect] Missing one or more required tokens in callback");
+        this.log.error("Original: " + callbackUrl);
+        this.log.error("Transformed: " + httpUrl);
+        throw new Error("Missing tokens from callback");
+    }
+
+    //
+    // STEP 4 — Token exchange via Cariad BFF (Python: fetchTokens)
+    //
+    this.log.info("[WeConnect] Step 4: Token exchange via Cariad BFF…");
+
+    const loginBody = JSON.stringify({
+        state,
+        id_token,
+        redirect_uri: "weconnect://authenticated",
+        region: "emea",
+        access_token,
+        authorizationCode: code
+    });
+
+    const headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
+        "user-agent": "Volkswagen/3.51.1-android/14",
+        "accept-language": "de-de",
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "x-android-package-name": "com.volkswagen.weconnect"
+    };
+
+    const { body: tokenResp } = await this._req({
+        method: "POST",
+        url: "https://emea.bff.cariad.digital/user-login/login/v1",
+        jar,
+        followRedirect: false,
+        gzip: true,
+        headers,
+        body: loginBody
+    });
+
+    let tokenData;
+    try {
+        tokenData = JSON.parse(tokenResp);
+    } catch (e) {
+        this.log.error("[WeConnect] Token JSON parse failed:");
+        this.log.error(tokenResp);
+        throw e;
+    }
+
+    // Map camelCase to snake_case like Python parseFromBody
+    const accessToken  = tokenData.accessToken  || tokenData.access_token;
+    const refreshToken = tokenData.refreshToken || tokenData.refresh_token;
+    const idToken      = tokenData.idToken      || tokenData.id_token;
+
+    if (!accessToken || !refreshToken || !idToken) {
+        this.log.error("[WeConnect] Token response incomplete:");
+        this.log.error(tokenResp);
+        throw new Error("Token response incomplete");
+    }
+
+    this._accessToken   = accessToken;
+    this._refreshToken  = refreshToken;
+    this._idToken       = idToken;
+
+    this.config.atoken  = accessToken;
+    this.config.rtoken  = refreshToken;
+    this.config.idtoken = idToken;
+
+    this.log.info("[WeConnect] Login successful ✔️");
+    return true;
+}
+
 
     receiveLoginUrl() {
         return new Promise((resolve, reject) => {
@@ -1615,7 +1598,7 @@ class VwWeConnect {
     }
 
     async logToDb() {
-    
+
       if (!this.currSession?.vin) throw new Error('VIN missing');
 
       try {
@@ -1624,16 +1607,16 @@ class VwWeConnect {
         const rngRaw = this.idData?.charging?.batteryStatus?.value?.cruisingRangeElectric_km;
         const latRaw = this.idParkingPosition?.data?.lat;
         const lonRaw = this.idParkingPosition?.data?.lon;
-    
+
         // helper: alleen geldige nummers, anders NULL
         const toNum = v => {
           const n = Number(v);
           return Number.isFinite(n) ? n : null;
         };
-    
+
         const sql = `INSERT INTO travel (vin, odo, soc, rng, lat, lon)
                      VALUES (?, ?, ?, ?, ?, ?)`;
-    
+
         const params = [
           this.currSession?.vin ?? null,
           toNum(odoRaw),
@@ -1642,7 +1625,7 @@ class VwWeConnect {
           toNum(latRaw),
           toNum(lonRaw),
         ];
-    
+
         const [result] = await this.config.db.promise().execute(sql, params);
         return result?.insertId ?? null;
       } catch (err) {
@@ -1650,7 +1633,7 @@ class VwWeConnect {
         return null; // of: throw err;
       }
     }
-    
+
     async runEventEmitters() {
         module.exports.idStatusEmitter.emit('eventRunStarted');
         if (typeof (this.idDataOld) == "undefined") {
@@ -1660,12 +1643,12 @@ class VwWeConnect {
         try {
             // parking
             if (this.idData.parking.data.carIsParked != this.idDataOld.parking.data.carIsParked) {
-                 if (this.config.db) {        
-                        const id = await this.logToDb(); 
+                 if (this.config.db) {
+                        const id = await this.logToDb();
                      }
-                if (this.idData.parking.data.carIsParked) {                    
+                if (this.idData.parking.data.carIsParked) {
                     module.exports.idStatusEmitter.emit('positionUpdate', this.idData.parking.data);
-                } else {                   
+                } else {
                     module.exports.idStatusEmitter.emit('positionUnknown');
                 }
                 module.exports.idStatusEmitter.emit('parked', this.idData.parking.data.carIsParked);
@@ -1837,7 +1820,7 @@ class VwWeConnect {
             this.log.debug(`VIN ${vin} has no parkingPosition capability`);
             return Promise.resolve(null); // altijd een Promise
         }
-  
+
         //if (this.currSession && vin !== this.currSession.vin) {
         //   return Promise.resolve(null);
         //}
@@ -2082,7 +2065,7 @@ class VwWeConnect {
                         //reset login parameters because of wecharge
                         this.type = "Id";
                         this.clientId = "a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com";
-                        this.scope = "openid profile badge cars dealers birthdate vin";
+                        this.scope = "openid profile badge cars dealers birthdate vin offline_access";
                         this.redirect = "weconnect://authenticated";
                         this.xrequest = "com.volkswagen.weconnect";
                         this.responseType = "code id_token token";
@@ -2872,3 +2855,4 @@ class VwWeConnect {
 
 module.exports.VwWeConnect = VwWeConnect;
 module.exports.Log = Log;
+
