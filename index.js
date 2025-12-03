@@ -954,7 +954,22 @@ async login() {
     return true;
 }
 
-
+ updateStatus() {
+        this.vinArray.forEach((vin) => {
+            if (vin === this.currSession.vin) {
+                this.getIdStatus(vin).catch((err) => {
+                    this.log.error("get id status Failed");
+                    this.refreshIDToken().catch((err) => { });
+                });
+                this.getIdParkingPosition(vin).catch((err) => {
+                    this.log.error("get id parking position Failed");
+                });
+            }
+            //this.getWcData();
+        });
+        return;
+    }
+    
     receiveLoginUrl() {
         return new Promise((resolve, reject) => {
             request(
