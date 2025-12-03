@@ -595,80 +595,63 @@ class VwWeConnect {
         });
     }
 
-    async _handleNewAuthFlow(startUrl, jar) {
+    async _handleConsentPage(url, jar) {
         const adapter = this;
         const ua = this.userAgent || "Volkswagen/3.51.1-android/14";
 
-        let url = startUrl;
-        let resp, body;
+        adapter.log.debug("[_handleConsentPage] GET " + url);
 
-        // === Initial fetch of authorization page (max 5 redirects) ===
-        let maxInitialRedirects = 5;
-        while (maxInitialRedirects > 0) {
-            // If we already got a custom scheme, just return it
-            if (url.startsWith("weconnect://")) {
-                adapter.log.debug("[_handleNewAuthFlow] Found custom scheme during initial fetch: " + url);
-                return url;
+        // GET the consent page
+        let { resp, body } = await this._req({
+            method: "GET",
+            url,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate"
             }
+        });
 
-            adapter.log.debug("[_handleNewAuthFlow] GET " + url);
-
-            ({ resp, body } = await this._req({
-                method: "GET",
-                url,
-                jar,
-                followRedirect: false,
-                gzip: true,
-                headers: {
-                    "User-Agent": ua,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate"
-                }
-            }));
-
-            const status = resp.statusCode;
-
-            if (status === 200) {
-                break;
-            }
-
-            if (status === 302 || status === 303) {
-                const loc = resp.headers.location;
-                if (!loc) {
-                    throw new Error("Forwarding without Location in headers (initial auth fetch)");
-                }
-                url = new URL(loc, url).toString();
-                maxInitialRedirects--;
-                continue;
-            }
-
-            throw new Error("Failed to fetch authorization page, status=" + status);
+        const status = resp.statusCode;
+        if (status === 500) {
+            throw new Error("Temporary server error during consent flow");
+        }
+        if (status !== 200) {
+            throw new Error("Unexpected status code during consent flow: " + status);
         }
 
-        if (maxInitialRedirects === 0) {
-            throw new Error("Too many redirects while fetching authorization page");
+        // Reuse your existing extractHidden() helper
+        const hiddenFields = this.extractHidden(body || "");
+        adapter.log.debug("[_handleConsentPage] Hidden fields: " + JSON.stringify(hiddenFields));
+
+        // Strip query from URL, like Python does
+        let postUrl = url;
+        try {
+            const u = new URL(url);
+            u.search = "";
+            postUrl = u.toString();
+        } catch (e) {
+            // fallback: strip by hand
+            const qIdx = url.indexOf("?");
+            if (qIdx >= 0) {
+                postUrl = url.substring(0, qIdx);
+            }
         }
 
-        // === Extract state token from HTML ===
-        const stateMatch = body && body.match(/<input[^>]*name="state"[^>]*value="([^"]*)"/);
-        const state = stateMatch && stateMatch[1];
-        if (!state) {
-            throw new Error("Could not find state token in authorization page");
-        }
+        // Build x-www-form-urlencoded body from hidden fields
+        const formBody = Object.keys(hiddenFields)
+            .map(k => encodeURIComponent(k) + "=" + encodeURIComponent(hiddenFields[k]))
+            .join("&");
 
-        // === POST username/password/state to /u/login?state=... ===
-        const loginUrl = "https://identity.vwgroup.io/u/login?state=" + encodeURIComponent(state);
-        const loginFormBody =
-            "username=" + encodeURIComponent(this.config.user) +
-            "&password=" + encodeURIComponent(this.config.password) +
-            "&state=" + encodeURIComponent(state);
-
-        adapter.log.debug("[_handleNewAuthFlow] POST credentials -> " + loginUrl);
+        adapter.log.debug("[_handleConsentPage] POST consent to " + postUrl);
 
         ({ resp, body } = await this._req({
             method: "POST",
-            url: loginUrl,
+            url: postUrl,
             jar,
             followRedirect: false,
             gzip: true,
@@ -679,228 +662,357 @@ class VwWeConnect {
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate"
             },
-            body: loginFormBody
+            body: formBody
         }));
 
-        const statusLogin = resp.statusCode;
-        if (!(statusLogin === 302 || statusLogin === 303)) {
-            throw new Error("Login failed with status code: " + statusLogin);
+        const postStatus = resp.statusCode;
+        if (postStatus === 500) {
+            throw new Error("Temporary server error during consent POST");
         }
-        if (!resp.headers.location) {
-            throw new Error("No Location header in login response");
-        }
-
-        let redirectUrl = resp.headers.location;
-        adapter.log.debug("[_handleNewAuthFlow] After-login redirect -> " + redirectUrl);
-
-        // === Follow redirects until weconnect://authenticated... (max 10 redirects) ===
-        let maxDepth = 10;
-        while (maxDepth > 0) {
-            adapter.log.debug("[_handleNewAuthFlow] Redirect loop depth=" + maxDepth +
-                " url=" + redirectUrl);
-
-            // Final callbacks
-            if (redirectUrl.startsWith("weconnect://authenticated")) {
-                adapter.log.debug("[_handleNewAuthFlow] Reached OAuth callback URL");
-                return redirectUrl;
-            }
-            if (redirectUrl.startsWith("weconnect://")) {
-                adapter.log.debug("[_handleNewAuthFlow] Found custom scheme URL: " + redirectUrl);
-                return redirectUrl;
-            }
-
-            const absUrl = redirectUrl.startsWith("http")
-                ? redirectUrl
-                : "https://identity.vwgroup.io" + redirectUrl;
-
-            ({ resp, body } = await this._req({
-                method: "GET",
-                url: absUrl,
-                jar,
-                followRedirect: false,
-                gzip: true,
-                headers: {
-                    "User-Agent": ua,
-                    "Accept": "*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate"
-                }
-            }));
-
-            const status = resp.statusCode;
-            if (status === 500) {
-                throw new Error("Temporary server error during new auth flow");
-            }
-            if (!resp.headers.location) {
-                throw new Error("No Location header in redirect (new auth flow), status=" + status);
-            }
-
-            redirectUrl = resp.headers.location;
-            maxDepth--;
+        if (!(postStatus === 302 || postStatus === 303)) {
+            throw new Error("Forwarding expected (302/303) after consent POST, got " + postStatus);
         }
 
-        throw new Error("Too many redirects in new auth flow");
+        const loc = resp.headers.location;
+        if (!loc) {
+            throw new Error("Forwarding without Location in consent response");
+        }
+
+        const nextUrl = new URL(loc, postUrl).toString();
+        adapter.log.debug("[_handleConsentPage] Next URL after consent: " + nextUrl);
+        return nextUrl;
     }
 
+   async _handleNewAuthFlow(startUrl, jar) {
+    const adapter = this;
+    const ua = this.userAgent || "Volkswagen/3.51.1-android/14";
 
-    async login() {
-        const jar = request.jar();
-        this._jar = jar;
-        const adapter = this;
+    let url = startUrl;
+    let resp, body;
 
-        //
-        // STEP 1 — BFF authorize (like WeConnectSession.authorizationUrl)
-        //
-        const nonce = Math.random().toString(36).slice(2);
-        const authorizeInit =
-            "https://emea.bff.cariad.digital/user-login/v1/authorize" +
-            "?nonce=" + encodeURIComponent(nonce) +
-            "&redirect_uri=" + encodeURIComponent("weconnect://authenticated");
+    // === Initial fetch of authorization page (max 5 redirects) ===
+    let maxInitialRedirects = 5;
+    while (maxInitialRedirects > 0) {
+        // If we already got a custom scheme, just return it
+        if (url.startsWith("weconnect://")) {
+            adapter.log.info("[_handleNewAuthFlow] Found custom scheme during initial fetch: " + url);
+            return url;
+        }
 
-        this.log.debug("Step 1: GET authorize -> " + authorizeInit);
+        adapter.log.debug("[_handleNewAuthFlow] GET " + url);
 
-        let { resp } = await this._req({
+        ({ resp, body } = await this._req({
             method: "GET",
-            url: authorizeInit,
-            jar,
-            followRedirect: false,
-            gzip: true
-        });
-
-        if (!resp.headers.location) {
-            this.log.error("Missing Location header from BFF authorize");
-            throw new Error("Missing Location header from BFF authorize");
-        }
-
-        const firstRedirect = resp.headers.location;
-        this.log.debug("Step 2: First redirect -> " + firstRedirect);
-
-        //
-        // STEP 2 — New auth flow (Python: _handle_new_auth_flow)
-        //
-        const callbackUrl = await this._handleNewAuthFlow(firstRedirect, jar);
-
-        if (!callbackUrl || !callbackUrl.startsWith("weconnect://")) {
-            this.log.error("Unexpected callback URL: " + callbackUrl);
-            throw new Error("Unexpected callback URL");
-        }
-
-        this.log.debug("Step 3: Final redirect reached: " + callbackUrl);
-
-        //
-        // STEP 3 — Transform custom scheme like Python + parse params
-        //
-        function makeHttpFromCustomScheme(cbUrl) {
-            const hashIdx = cbUrl.indexOf("#");
-            const qIdx = cbUrl.indexOf("?");
-
-            let qs = "";
-            if (hashIdx >= 0) {
-                qs = cbUrl.substring(hashIdx + 1);
-            } else if (qIdx >= 0) {
-                qs = cbUrl.substring(qIdx + 1);
-            } else {
-                return null;
-            }
-            return "https://egal?" + qs;
-        }
-
-        const httpUrl = makeHttpFromCustomScheme(callbackUrl);
-        if (!httpUrl) {
-            adapter.log.error("Callback URL has no query or fragment: " + callbackUrl);
-            throw new Error("Callback URL has no parameters");
-        }
-
-        this.log.debug("Transformed callback URL -> " + httpUrl);
-
-        let urlObj;
-        try {
-            urlObj = new URL(httpUrl);
-        } catch (e) {
-            this.log.error("Failed to parse transformed callback URL:");
-            this.log.error(httpUrl);
-            throw e;
-        }
-
-        const params = urlObj.searchParams;
-        const code = params.get("code");
-        const id_token = params.get("id_token");
-        const access_token = params.get("access_token");
-        const state = params.get("state");
-
-        if (!code || !id_token || !access_token || !state) {
-            this.log.error("Missing one or more required tokens in callback");
-            this.log.error("Original: " + callbackUrl);
-            this.log.error("Transformed: " + httpUrl);
-            throw new Error("Missing tokens from callback");
-        }
-
-        //
-        // STEP 4 — Token exchange via Cariad BFF (Python: fetchTokens)
-        //
-        this.log.debug("Step 4: Token exchange via Cariad BFF...");
-
-        const loginBody = JSON.stringify({
-            state,
-            id_token,
-            redirect_uri: "weconnect://authenticated",
-            region: "emea",
-            access_token,
-            authorizationCode: code
-        });
-
-        const headers = {
-            "accept": "application/json",
-            "content-type": "application/json",
-            "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-            "user-agent": "Volkswagen/3.51.1-android/14",
-            "accept-language": "de-de",
-            "cache-control": "no-cache",
-            "pragma": "no-cache",
-            "x-android-package-name": "com.volkswagen.weconnect"
-        };
-
-        const { body: tokenResp } = await this._req({
-            method: "POST",
-            url: "https://emea.bff.cariad.digital/user-login/login/v1",
+            url,
             jar,
             followRedirect: false,
             gzip: true,
-            headers,
-            body: loginBody
-        });
+            headers: {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate"
+            }
+        }));
 
-        let tokenData;
-        try {
-            tokenData = JSON.parse(tokenResp);
-        } catch (e) {
-            this.log.error("Token JSON parse failed:");
-            this.log.error(tokenResp);
-            throw e;
+        const status = resp.statusCode;
+
+        if (status === 200) {
+            break;
         }
 
-        // Map camelCase to snake_case like Python parseFromBody
-        const accessToken = tokenData.accessToken || tokenData.access_token;
-        const refreshToken = tokenData.refreshToken || tokenData.refresh_token;
-        const idToken = tokenData.idToken || tokenData.id_token;
-
-        if (!accessToken || !refreshToken || !idToken) {
-            this.log.error("Token response incomplete:");
-            this.log.error(JSON.stringify(tokenData, null, 2));
-            throw new Error("Token response incomplete");
+        if (status === 302 || status === 303) {
+            const loc = resp.headers.location;
+            if (!loc) {
+                throw new Error("Forwarding without Location in headers (initial auth fetch)");
+            }
+            url = new URL(loc, url).toString();
+            maxInitialRedirects--;
+            continue;
         }
 
-        this._accessToken = accessToken;
-        this._refreshToken = refreshToken;
-        this._idToken = idToken;
-
-        this.config.atoken = accessToken;
-        this.config.rtoken = refreshToken;
-        this.config.idtoken = idToken;
-
-        this.log.debug("Login successful");
-        return true;
+        throw new Error("Failed to fetch authorization page, status=" + status);
     }
+
+    if (maxInitialRedirects === 0) {
+        throw new Error("Too many redirects while fetching authorization page");
+    }
+
+    // === Extract state token from HTML ===
+    const stateMatch = body && body.match(/<input[^>]*name="state"[^>]*value="([^"]*)"/);
+    const state = stateMatch && stateMatch[1];
+    if (!state) {
+        throw new Error("Could not find state token in authorization page");
+    }
+
+    // === POST username/password/state to /u/login?state=... ===
+    const loginUrl = "https://identity.vwgroup.io/u/login?state=" + encodeURIComponent(state);
+    const loginFormBody =
+        "username=" + encodeURIComponent(this.config.user) +
+        "&password=" + encodeURIComponent(this.config.password) +
+        "&state=" + encodeURIComponent(state);
+
+    adapter.log.debug("[_handleNewAuthFlow] POST credentials to " + loginUrl);
+
+    ({ resp, body } = await this._req({
+        method: "POST",
+        url: loginUrl,
+        jar,
+        followRedirect: false,
+        gzip: true,
+        headers: {
+            "User-Agent": ua,
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate"
+        },
+        body: loginFormBody
+    }));
+
+    const statusLogin = resp.statusCode;
+    if (!(statusLogin === 302 || statusLogin === 303)) {
+        throw new Error("Login failed with status code: " + statusLogin);
+    }
+    if (!resp.headers.location) {
+        throw new Error("No Location header in login response");
+    }
+
+    let redirectUrl = resp.headers.location;
+    adapter.log.debug("[_handleNewAuthFlow] After-login redirect: " + redirectUrl);
+
+    // === Follow redirects until weconnect://authenticated... (max 10 redirects) ===
+    let maxDepth = 10;
+    while (maxDepth > 0) {
+        adapter.log.debug("[_handleNewAuthFlow] Redirect loop depth=" + maxDepth + " url=" + redirectUrl);
+
+        // Final callbacks
+        if (redirectUrl.startsWith("weconnect://authenticated")) {
+            adapter.log.info("[_handleNewAuthFlow] Reached OAuth callback URL");
+            return redirectUrl;
+        }
+        if (redirectUrl.startsWith("weconnect://")) {
+            adapter.log.info("[_handleNewAuthFlow] Found custom scheme URL: " + redirectUrl);
+            return redirectUrl;
+        }
+
+        // Handle consent / terms-and-conditions pages (like Python)
+        if (redirectUrl.indexOf("terms-and-conditions") !== -1) {
+            adapter.log.info("[_handleNewAuthFlow] Detected terms-and-conditions page");
+            redirectUrl = await this._handleConsentPage(
+                redirectUrl.startsWith("http")
+                    ? redirectUrl
+                    : "https://identity.vwgroup.io" + redirectUrl,
+                jar
+            );
+            // After consent, continue the redirect loop with the new URL
+            maxDepth--;
+            continue;
+        }
+
+        const absUrl = redirectUrl.startsWith("http")
+            ? redirectUrl
+            : "https://identity.vwgroup.io" + redirectUrl;
+
+        adapter.log.debug("[_handleNewAuthFlow] GET " + absUrl);
+
+        ({ resp, body } = await this._req({
+            method: "GET",
+            url: absUrl,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": ua,
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate"
+            }
+        }));
+
+        const status = resp.statusCode;
+        if (status === 500) {
+            throw new Error("Temporary server error during new auth flow");
+        }
+
+        if (!resp.headers.location) {
+            // Might be a final page, check again if it contains a custom scheme
+            if (absUrl.startsWith("weconnect://")) {
+                adapter.log.info("[_handleNewAuthFlow] Reached custom scheme without Location");
+                return absUrl;
+            }
+            throw new Error("No Location header in redirect (new auth flow), status=" + status);
+        }
+
+        redirectUrl = resp.headers.location;
+        adapter.log.debug("[_handleNewAuthFlow] Next redirect: " + redirectUrl);
+
+        // Check again for final callbacks before next iteration
+        if (redirectUrl.startsWith("weconnect://authenticated")) {
+            adapter.log.info("[_handleNewAuthFlow] Reached OAuth callback URL after redirect");
+            return redirectUrl;
+        }
+        if (redirectUrl.startsWith("weconnect://")) {
+            adapter.log.info("[_handleNewAuthFlow] Found custom scheme URL after redirect: " + redirectUrl);
+            return redirectUrl;
+        }
+
+        maxDepth--;
+    }
+
+    throw new Error("Too many redirects in new auth flow");
+}
+
+
+
+    async login() {
+    const jar = request.jar();
+    this._jar = jar;
+    const adapter = this;
+
+    // STEP 1 — BFF authorize
+    const nonce = Math.random().toString(36).slice(2);
+    const authorizeInit =
+        "https://emea.bff.cariad.digital/user-login/v1/authorize" +
+        "?nonce=" + encodeURIComponent(nonce) +
+        "&redirect_uri=" + encodeURIComponent("weconnect://authenticated");
+
+    this.log.debug("Step 1: GET authorize -> " + authorizeInit);
+
+    let { resp } = await this._req({
+        method: "GET",
+        url: authorizeInit,
+        jar,
+        followRedirect: false,
+        gzip: true
+    });
+
+    if (!resp.headers.location) {
+        throw new Error("Missing Location header from BFF authorize");
+    }
+
+    const firstRedirect = resp.headers.location;
+    this.log.debug("Step 2: First redirect -> " + firstRedirect);
+
+    // STEP 2 — New auth flow
+    const callbackUrl = await this._handleNewAuthFlow(firstRedirect, jar);
+
+    if (!callbackUrl || !callbackUrl.startsWith("weconnect://")) {
+        this.log.error("Unexpected callback URL: " + callbackUrl);
+        throw new Error("Unexpected callback URL");
+    }
+
+    this.log.debug("Step 3: Final redirect reached -> extracting tokens");
+
+    // STEP 3 — Transform custom scheme and parse params (unchanged)
+    function makeHttpFromCustomScheme(cbUrl) {
+        const hashIdx = cbUrl.indexOf("#");
+        const qIdx = cbUrl.indexOf("?");
+
+        let qs = "";
+        if (hashIdx >= 0) {
+            qs = cbUrl.substring(hashIdx + 1);
+        } else if (qIdx >= 0) {
+            qs = cbUrl.substring(qIdx + 1);
+        } else {
+            return null;
+        }
+        return "https://egal?" + qs;
+    }
+
+    const httpUrl = makeHttpFromCustomScheme(callbackUrl);
+    if (!httpUrl) {
+        adapter.log.error("Callback URL has no query or fragment: " + callbackUrl);
+        throw new Error("Callback URL has no parameters");
+    }
+
+    this.log.debug("Transformed callback URL -> " + httpUrl);
+
+    let urlObj;
+    try {
+        urlObj = new URL(httpUrl);
+    } catch (e) {
+        this.log.error("Failed to parse transformed callback URL: " + httpUrl);
+        throw e;
+    }
+
+    const params = urlObj.searchParams;
+    const code         = params.get("code");
+    const id_token     = params.get("id_token");
+    const access_token = params.get("access_token");
+    const state        = params.get("state");
+
+    if (!code || !id_token || !access_token || !state) {
+        this.log.error("Missing one or more required tokens in callback");
+        this.log.error("Original: " + callbackUrl);
+        this.log.error("Transformed: " + httpUrl);
+        throw new Error("Missing tokens from callback");
+    }
+
+    // STEP 4 — Token exchange via Cariad BFF
+    this.log.debug("Step 4: Token exchange via Cariad BFF");
+
+    const loginBody = JSON.stringify({
+        state,
+        id_token,
+        redirect_uri: "weconnect://authenticated",
+        region: "emea",
+        access_token,
+        authorizationCode: code
+    });
+
+    const headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
+        "user-agent": "Volkswagen/3.51.1-android/14",
+        "accept-language": "de-de",
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+        "x-android-package-name": "com.volkswagen.weconnect"
+    };
+
+    const { body: tokenResp } = await this._req({
+        method: "POST",
+        url: "https://emea.bff.cariad.digital/user-login/login/v1",
+        jar,
+        followRedirect: false,
+        gzip: true,
+        headers,
+        body: loginBody
+    });
+
+    let tokenData;
+    try {
+        tokenData = JSON.parse(tokenResp);
+    } catch (e) {
+        this.log.error("Token JSON parse failed");
+        this.log.error(tokenResp);
+        throw e;
+    }
+
+    const accessToken  = tokenData.accessToken  || tokenData.access_token;
+    const refreshToken = tokenData.refreshToken || tokenData.refresh_token;
+    const idToken      = tokenData.idToken      || tokenData.id_token;
+
+    if (!accessToken || !refreshToken || !idToken) {
+        this.log.error("Token response incomplete");
+        this.log.error(tokenResp);
+        throw new Error("Token response incomplete");
+    }
+
+    this._accessToken   = accessToken;
+    this._refreshToken  = refreshToken;
+    this._idToken       = idToken;
+
+    this.config.atoken  = accessToken;
+    this.config.rtoken  = refreshToken;
+    this.config.idtoken = idToken;
+
+    this.log.info("Login successful");
+    return true;
+}
+
 
 
     updateStatus() {
@@ -1779,8 +1891,8 @@ class VwWeConnect {
                         err && this.log.error(err);
                         body && this.log.error(JSON.stringify(body));
 
-                        // Python-achtig gedrag: bij 401/403 is refresh token ongeldig -> full login
-                        if (status === 401 || status === 403) {
+                        // Python-achtig gedrag: bij 4xx (bijv. scope-mismatch 400 of 401/403) is refresh token ongeldig -> full login
+                        if (status >= 400 && status < 500) {
                             this.log.error("Refresh token invalid or expired, trying full login");
                             try {
                                 await this.login();
