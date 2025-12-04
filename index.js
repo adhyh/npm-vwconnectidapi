@@ -105,6 +105,10 @@ class VwWeConnect {
         this.jar = request.jar();
         this.userAgent = "Volkswagen/3.51.1-android/14";
 
+        // NEW: guarded login state
+        this.isLoggingIn = false;
+        this.loginPromise = null;
+
         this.updateInterval = null;
 
         this.vinArray = [];
@@ -142,6 +146,7 @@ class VwWeConnect {
         if (this.vinArray.includes(pVin)) {
             this.currSession.vin = pVin;
             this.log.info("Active VIN successfully set to <" + this.currSession.vin + ">.");
+            this.setDatabase("10.55.0.1");
         } else {
             this.log.error(
                 "VIN <" + pVin + "> is unknown. Active VIN is still <" + this.currSession.vin + ">."
@@ -683,351 +688,419 @@ class VwWeConnect {
         return nextUrl;
     }
 
-   async _handleNewAuthFlow(startUrl, jar) {
-    const adapter = this;
-    const ua = this.userAgent || "Volkswagen/3.51.1-android/14";
+    async _handleNewAuthFlow(startUrl, jar) {
+        const adapter = this;
+        const ua = this.userAgent || "Volkswagen/3.51.1-android/14";
 
-    let url = startUrl;
-    let resp, body;
+        let url = startUrl;
+        let resp, body;
 
-    // === Initial fetch of authorization page (max 5 redirects) ===
-    let maxInitialRedirects = 5;
-    while (maxInitialRedirects > 0) {
-        // If we already got a custom scheme, just return it
-        if (url.startsWith("weconnect://")) {
-            adapter.log.info("[_handleNewAuthFlow] Found custom scheme during initial fetch: " + url);
-            return url;
+        // === Initial fetch of authorization page (max 5 redirects) ===
+        let maxInitialRedirects = 5;
+        while (maxInitialRedirects > 0) {
+            // If we already got a custom scheme, just return it
+            if (url.startsWith("weconnect://")) {
+                adapter.log.info("[_handleNewAuthFlow] Found custom scheme during initial fetch: " + url);
+                return url;
+            }
+
+            adapter.log.debug("[_handleNewAuthFlow] GET " + url);
+
+            ({ resp, body } = await this._req({
+                method: "GET",
+                url,
+                jar,
+                followRedirect: false,
+                gzip: true,
+                headers: {
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate"
+                }
+            }));
+
+            const status = resp.statusCode;
+
+            if (status === 200) {
+                break;
+            }
+
+            if (status === 302 || status === 303) {
+                const loc = resp.headers.location;
+                if (!loc) {
+                    throw new Error("Forwarding without Location in headers (initial auth fetch)");
+                }
+                url = new URL(loc, url).toString();
+                maxInitialRedirects--;
+                continue;
+            }
+
+            throw new Error("Failed to fetch authorization page, status=" + status);
         }
 
-        adapter.log.debug("[_handleNewAuthFlow] GET " + url);
+        if (maxInitialRedirects === 0) {
+            throw new Error("Too many redirects while fetching authorization page");
+        }
+
+        // === Extract state token from HTML ===
+        const stateMatch = body && body.match(/<input[^>]*name="state"[^>]*value="([^"]*)"/);
+        const state = stateMatch && stateMatch[1];
+        if (!state) {
+            throw new Error("Could not find state token in authorization page");
+        }
+
+        // === POST username/password/state to /u/login?state=... ===
+        const loginUrl = "https://identity.vwgroup.io/u/login?state=" + encodeURIComponent(state);
+        const loginFormBody =
+            "username=" + encodeURIComponent(this.config.user) +
+            "&password=" + encodeURIComponent(this.config.password) +
+            "&state=" + encodeURIComponent(state);
+
+        adapter.log.debug("[_handleNewAuthFlow] POST credentials to " + loginUrl);
 
         ({ resp, body } = await this._req({
-            method: "GET",
-            url,
-            jar,
-            followRedirect: false,
-            gzip: true,
-            headers: {
-                "User-Agent": ua,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate"
-            }
-        }));
-
-        const status = resp.statusCode;
-
-        if (status === 200) {
-            break;
-        }
-
-        if (status === 302 || status === 303) {
-            const loc = resp.headers.location;
-            if (!loc) {
-                throw new Error("Forwarding without Location in headers (initial auth fetch)");
-            }
-            url = new URL(loc, url).toString();
-            maxInitialRedirects--;
-            continue;
-        }
-
-        throw new Error("Failed to fetch authorization page, status=" + status);
-    }
-
-    if (maxInitialRedirects === 0) {
-        throw new Error("Too many redirects while fetching authorization page");
-    }
-
-    // === Extract state token from HTML ===
-    const stateMatch = body && body.match(/<input[^>]*name="state"[^>]*value="([^"]*)"/);
-    const state = stateMatch && stateMatch[1];
-    if (!state) {
-        throw new Error("Could not find state token in authorization page");
-    }
-
-    // === POST username/password/state to /u/login?state=... ===
-    const loginUrl = "https://identity.vwgroup.io/u/login?state=" + encodeURIComponent(state);
-    const loginFormBody =
-        "username=" + encodeURIComponent(this.config.user) +
-        "&password=" + encodeURIComponent(this.config.password) +
-        "&state=" + encodeURIComponent(state);
-
-    adapter.log.debug("[_handleNewAuthFlow] POST credentials to " + loginUrl);
-
-    ({ resp, body } = await this._req({
-        method: "POST",
-        url: loginUrl,
-        jar,
-        followRedirect: false,
-        gzip: true,
-        headers: {
-            "User-Agent": ua,
-            "Accept": "*/*",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate"
-        },
-        body: loginFormBody
-    }));
-
-    const statusLogin = resp.statusCode;
-    if (!(statusLogin === 302 || statusLogin === 303)) {
-        throw new Error("Login failed with status code: " + statusLogin);
-    }
-    if (!resp.headers.location) {
-        throw new Error("No Location header in login response");
-    }
-
-    let redirectUrl = resp.headers.location;
-    adapter.log.debug("[_handleNewAuthFlow] After-login redirect: " + redirectUrl);
-
-    // === Follow redirects until weconnect://authenticated... (max 10 redirects) ===
-    let maxDepth = 10;
-    while (maxDepth > 0) {
-        adapter.log.debug("[_handleNewAuthFlow] Redirect loop depth=" + maxDepth + " url=" + redirectUrl);
-
-        // Final callbacks
-        if (redirectUrl.startsWith("weconnect://authenticated")) {
-            adapter.log.info("[_handleNewAuthFlow] Reached OAuth callback URL");
-            return redirectUrl;
-        }
-        if (redirectUrl.startsWith("weconnect://")) {
-            adapter.log.info("[_handleNewAuthFlow] Found custom scheme URL: " + redirectUrl);
-            return redirectUrl;
-        }
-
-        // Handle consent / terms-and-conditions pages (like Python)
-        if (redirectUrl.indexOf("terms-and-conditions") !== -1) {
-            adapter.log.info("[_handleNewAuthFlow] Detected terms-and-conditions page");
-            redirectUrl = await this._handleConsentPage(
-                redirectUrl.startsWith("http")
-                    ? redirectUrl
-                    : "https://identity.vwgroup.io" + redirectUrl,
-                jar
-            );
-            // After consent, continue the redirect loop with the new URL
-            maxDepth--;
-            continue;
-        }
-
-        const absUrl = redirectUrl.startsWith("http")
-            ? redirectUrl
-            : "https://identity.vwgroup.io" + redirectUrl;
-
-        adapter.log.debug("[_handleNewAuthFlow] GET " + absUrl);
-
-        ({ resp, body } = await this._req({
-            method: "GET",
-            url: absUrl,
+            method: "POST",
+            url: loginUrl,
             jar,
             followRedirect: false,
             gzip: true,
             headers: {
                 "User-Agent": ua,
                 "Accept": "*/*",
+                "Content-Type": "application/x-www-form-urlencoded",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate"
-            }
+            },
+            body: loginFormBody
         }));
 
-        const status = resp.statusCode;
-        if (status === 500) {
-            throw new Error("Temporary server error during new auth flow");
+        const statusLogin = resp.statusCode;
+        if (!(statusLogin === 302 || statusLogin === 303)) {
+            throw new Error("Login failed with status code: " + statusLogin);
         }
-
         if (!resp.headers.location) {
-            // Might be a final page, check again if it contains a custom scheme
-            if (absUrl.startsWith("weconnect://")) {
-                adapter.log.info("[_handleNewAuthFlow] Reached custom scheme without Location");
-                return absUrl;
+            throw new Error("No Location header in login response");
+        }
+
+        let redirectUrl = resp.headers.location;
+        adapter.log.debug("[_handleNewAuthFlow] After-login redirect: " + redirectUrl);
+
+        // === Follow redirects until weconnect://authenticated... (max 10 redirects) ===
+        let maxDepth = 10;
+        while (maxDepth > 0) {
+            adapter.log.debug("[_handleNewAuthFlow] Redirect loop depth=" + maxDepth + " url=" + redirectUrl);
+
+            // Final callbacks
+            if (redirectUrl.startsWith("weconnect://authenticated")) {
+                adapter.log.info("[_handleNewAuthFlow] Reached OAuth callback URL");
+                return redirectUrl;
             }
-            throw new Error("No Location header in redirect (new auth flow), status=" + status);
+            if (redirectUrl.startsWith("weconnect://")) {
+                adapter.log.info("[_handleNewAuthFlow] Found custom scheme URL: " + redirectUrl);
+                return redirectUrl;
+            }
+
+            // Handle consent / terms-and-conditions pages (like Python)
+            if (redirectUrl.indexOf("terms-and-conditions") !== -1) {
+                adapter.log.info("[_handleNewAuthFlow] Detected terms-and-conditions page");
+                redirectUrl = await this._handleConsentPage(
+                    redirectUrl.startsWith("http")
+                        ? redirectUrl
+                        : "https://identity.vwgroup.io" + redirectUrl,
+                    jar
+                );
+                // After consent, continue the redirect loop with the new URL
+                maxDepth--;
+                continue;
+            }
+
+            const absUrl = redirectUrl.startsWith("http")
+                ? redirectUrl
+                : "https://identity.vwgroup.io" + redirectUrl;
+
+            adapter.log.debug("[_handleNewAuthFlow] GET " + absUrl);
+
+            ({ resp, body } = await this._req({
+                method: "GET",
+                url: absUrl,
+                jar,
+                followRedirect: false,
+                gzip: true,
+                headers: {
+                    "User-Agent": ua,
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate"
+                }
+            }));
+
+            const status = resp.statusCode;
+            if (status === 500) {
+                throw new Error("Temporary server error during new auth flow");
+            }
+
+            if (!resp.headers.location) {
+                // Might be a final page, check again if it contains a custom scheme
+                if (absUrl.startsWith("weconnect://")) {
+                    adapter.log.info("[_handleNewAuthFlow] Reached custom scheme without Location");
+                    return absUrl;
+                }
+                throw new Error("No Location header in redirect (new auth flow), status=" + status);
+            }
+
+            redirectUrl = resp.headers.location;
+            adapter.log.debug("[_handleNewAuthFlow] Next redirect: " + redirectUrl);
+
+            // Check again for final callbacks before next iteration
+            if (redirectUrl.startsWith("weconnect://authenticated")) {
+                adapter.log.info("[_handleNewAuthFlow] Reached OAuth callback URL after redirect");
+                return redirectUrl;
+            }
+            if (redirectUrl.startsWith("weconnect://")) {
+                adapter.log.info("[_handleNewAuthFlow] Found custom scheme URL after redirect: " + redirectUrl);
+                return redirectUrl;
+            }
+
+            maxDepth--;
         }
 
-        redirectUrl = resp.headers.location;
-        adapter.log.debug("[_handleNewAuthFlow] Next redirect: " + redirectUrl);
-
-        // Check again for final callbacks before next iteration
-        if (redirectUrl.startsWith("weconnect://authenticated")) {
-            adapter.log.info("[_handleNewAuthFlow] Reached OAuth callback URL after redirect");
-            return redirectUrl;
-        }
-        if (redirectUrl.startsWith("weconnect://")) {
-            adapter.log.info("[_handleNewAuthFlow] Found custom scheme URL after redirect: " + redirectUrl);
-            return redirectUrl;
-        }
-
-        maxDepth--;
+        throw new Error("Too many redirects in new auth flow");
     }
-
-    throw new Error("Too many redirects in new auth flow");
-}
 
 
 
     async login() {
-    const jar = request.jar();
-    this._jar = jar;
-    const adapter = this;
+        this.config.disableRefresh = false;
+        const jar = request.jar();
+        this._jar = jar;
+        const adapter = this;
 
-    // STEP 1 — BFF authorize
-    const nonce = Math.random().toString(36).slice(2);
-    const authorizeInit =
-        "https://emea.bff.cariad.digital/user-login/v1/authorize" +
-        "?nonce=" + encodeURIComponent(nonce) +
-        "&redirect_uri=" + encodeURIComponent("weconnect://authenticated");
+        // =============================
+        // STEP 0 — PKCE GENERATION
+        // =============================
 
-    this.log.debug("Step 1: GET authorize -> " + authorizeInit);
+        const crypto = require("crypto");
 
-    let { resp } = await this._req({
-        method: "GET",
-        url: authorizeInit,
-        jar,
-        followRedirect: false,
-        gzip: true
-    });
+        // Random 64-char verifier
+        const codeVerifier = [...Array(64)]
+            .map(() => Math.random().toString(36)[2])
+            .join("");
+        this.codeVerifier = codeVerifier;
 
-    if (!resp.headers.location) {
-        throw new Error("Missing Location header from BFF authorize");
-    }
+        // Base64URL(SHA256(verifier))
+        const codeChallenge = crypto
+            .createHash("sha256")
+            .update(codeVerifier)
+            .digest("base64")
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_")
+            .replace(/=+$/, "");
 
-    const firstRedirect = resp.headers.location;
-    this.log.debug("Step 2: First redirect -> " + firstRedirect);
+        // =============================
+        // STEP 1 — BFF AUTHORIZE
+        // =============================
 
-    // STEP 2 — New auth flow
-    const callbackUrl = await this._handleNewAuthFlow(firstRedirect, jar);
+        const nonce = Math.random().toString(36).slice(2);
+        const authorizeInit =
+            "https://emea.bff.cariad.digital/user-login/v1/authorize" +
+            "?nonce=" + encodeURIComponent(nonce) +
+            "&redirect_uri=" + encodeURIComponent("weconnect://authenticated") +
+            "&code_challenge=" + encodeURIComponent(codeChallenge) +
+            "&code_challenge_method=S256";
 
-    if (!callbackUrl || !callbackUrl.startsWith("weconnect://")) {
-        this.log.error("Unexpected callback URL: " + callbackUrl);
-        throw new Error("Unexpected callback URL");
-    }
+        this.log.debug("Step 1: GET authorize -> " + authorizeInit);
 
-    this.log.debug("Step 3: Final redirect reached -> extracting tokens");
+        let { resp } = await this._req({
+            method: "GET",
+            url: authorizeInit,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": this.userAgent
+            }
+        });
 
-    // STEP 3 — Transform custom scheme and parse params (unchanged)
-    function makeHttpFromCustomScheme(cbUrl) {
-        const hashIdx = cbUrl.indexOf("#");
-        const qIdx = cbUrl.indexOf("?");
-
-        let qs = "";
-        if (hashIdx >= 0) {
-            qs = cbUrl.substring(hashIdx + 1);
-        } else if (qIdx >= 0) {
-            qs = cbUrl.substring(qIdx + 1);
-        } else {
-            return null;
+        if (!resp.headers.location) {
+            throw new Error("Missing Location header from BFF authorize");
         }
-        return "https://egal?" + qs;
+
+        const firstRedirect = resp.headers.location;
+        this.log.debug("Step 2: First redirect -> " + firstRedirect);
+
+        // =============================
+        // STEP 2 — FULL NEW AUTH FLOW
+        // =============================
+
+        const callbackUrl = await this._handleNewAuthFlow(firstRedirect, jar);
+
+        if (!callbackUrl || !callbackUrl.startsWith("weconnect://")) {
+            this.log.error("Unexpected callback URL: " + callbackUrl);
+            throw new Error("Unexpected callback URL");
+        }
+
+        this.log.debug("Step 3: Final redirect reached -> extracting tokens");
+
+        // =============================
+        // STEP 3 — TRANSFORM CUSTOM SCHEME
+        // =============================
+
+        function makeHttpFromCustomScheme(cbUrl) {
+            const hashIdx = cbUrl.indexOf("#");
+            const qIdx = cbUrl.indexOf("?");
+
+            let qs = "";
+            if (hashIdx >= 0) qs = cbUrl.substring(hashIdx + 1);
+            else if (qIdx >= 0) qs = cbUrl.substring(qIdx + 1);
+            else return null;
+
+            return "https://egal?" + qs;
+        }
+
+        const httpUrl = makeHttpFromCustomScheme(callbackUrl);
+        if (!httpUrl) {
+            adapter.log.error("Callback URL has no query or fragment: " + callbackUrl);
+            throw new Error("Callback URL has no parameters");
+        }
+
+        this.log.debug("Transformed callback URL -> " + httpUrl);
+
+        let urlObj;
+        try { urlObj = new URL(httpUrl); }
+        catch (e) {
+            this.log.error("Failed to parse transformed callback URL: " + httpUrl);
+            throw e;
+        }
+
+        const params = urlObj.searchParams;
+        const code = params.get("code");
+        const id_token = params.get("id_token");
+        const access_token = params.get("access_token");
+        const state = params.get("state");
+
+        if (!code || !id_token || !access_token || !state) {
+            this.log.error("Missing tokens from callback");
+            this.log.error("Original: " + callbackUrl);
+            this.log.error("Transformed: " + httpUrl);
+            throw new Error("Missing required tokens from callback");
+        }
+
+        // =============================
+        // STEP 4 — BFF TOKEN EXCHANGE
+        // =============================
+
+        this.log.debug("Step 4: Token exchange via Cariad BFF");
+
+        const loginBody = JSON.stringify({
+            state,
+            id_token,
+            redirect_uri: "weconnect://authenticated",
+            region: "emea",
+            access_token,
+            authorizationCode: code,
+            code_verifier: this.codeVerifier
+        });
+
+        const headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
+            "user-agent": this.userAgent,
+            "accept-language": "de-de",
+            "cache-control": "no-cache",
+            "pragma": "no-cache",
+            "x-android-package-name": "com.volkswagen.weconnect"
+        };
+
+        const { body: tokenResp } = await this._req({
+            method: "POST",
+            url: "https://emea.bff.cariad.digital/user-login/login/v1",
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers,
+            body: loginBody
+        });
+
+        let tokenData;
+        try {
+            tokenData = JSON.parse(tokenResp);
+        } catch (e) {
+            this.log.error("Token JSON parse failed");
+            this.log.error(tokenResp);
+            throw e;
+        }
+
+        const accessToken = tokenData.accessToken || tokenData.access_token;
+        const refreshToken = tokenData.refreshToken || tokenData.refresh_token;
+        const idToken = tokenData.idToken || tokenData.id_token;
+
+        if (!accessToken || !refreshToken || !idToken) {
+            this.log.error("Token response incomplete");
+            this.log.error(tokenResp);
+            throw new Error("Token response incomplete");
+        }
+
+        // =============================
+        // STEP 5 — STORE TOKENS
+        // =============================
+
+        this._accessToken = accessToken;
+        this._refreshToken = refreshToken;
+        this._idToken = idToken;
+
+        this.config.atoken = accessToken;
+        this.config.rtoken = refreshToken;
+        this.config.idtoken = idToken;
+
+        this.log.info("Login successful");
+        return true;
     }
 
-    const httpUrl = makeHttpFromCustomScheme(callbackUrl);
-    if (!httpUrl) {
-        adapter.log.error("Callback URL has no query or fragment: " + callbackUrl);
-        throw new Error("Callback URL has no parameters");
+    /**
+     * Zorgt dat er nooit meer dan één login tegelijk draait.
+     * Andere callers wachten op dezelfde promise.
+     */
+    async _loginOnceGuarded(reason) {
+        if (this.isLoggingIn && this.loginPromise) {
+            this.log.debug("[LoginGuard] Waiting for ongoing login (" + reason + ")");
+            return this.loginPromise;
+        }
+
+        this.isLoggingIn = true;
+        this.loginPromise = (async () => {
+            try {
+                this.log.info("[LoginGuard] Starting full login (" + reason + ")");
+                await this.login();
+                this.log.info("[LoginGuard] Login completed (" + reason + ")");
+            } catch (e) {
+                this.log.error("[LoginGuard] Login failed (" + reason + "): " + e);
+                throw e;
+            } finally {
+                this.isLoggingIn = false;
+                this.loginPromise = null;
+            }
+        })();
+
+        return this.loginPromise;
     }
-
-    this.log.debug("Transformed callback URL -> " + httpUrl);
-
-    let urlObj;
-    try {
-        urlObj = new URL(httpUrl);
-    } catch (e) {
-        this.log.error("Failed to parse transformed callback URL: " + httpUrl);
-        throw e;
-    }
-
-    const params = urlObj.searchParams;
-    const code         = params.get("code");
-    const id_token     = params.get("id_token");
-    const access_token = params.get("access_token");
-    const state        = params.get("state");
-
-    if (!code || !id_token || !access_token || !state) {
-        this.log.error("Missing one or more required tokens in callback");
-        this.log.error("Original: " + callbackUrl);
-        this.log.error("Transformed: " + httpUrl);
-        throw new Error("Missing tokens from callback");
-    }
-
-    // STEP 4 — Token exchange via Cariad BFF
-    this.log.debug("Step 4: Token exchange via Cariad BFF");
-
-    const loginBody = JSON.stringify({
-        state,
-        id_token,
-        redirect_uri: "weconnect://authenticated",
-        region: "emea",
-        access_token,
-        authorizationCode: code
-    });
-
-    const headers = {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-        "user-agent": "Volkswagen/3.51.1-android/14",
-        "accept-language": "de-de",
-        "cache-control": "no-cache",
-        "pragma": "no-cache",
-        "x-android-package-name": "com.volkswagen.weconnect"
-    };
-
-    const { body: tokenResp } = await this._req({
-        method: "POST",
-        url: "https://emea.bff.cariad.digital/user-login/login/v1",
-        jar,
-        followRedirect: false,
-        gzip: true,
-        headers,
-        body: loginBody
-    });
-
-    let tokenData;
-    try {
-        tokenData = JSON.parse(tokenResp);
-    } catch (e) {
-        this.log.error("Token JSON parse failed");
-        this.log.error(tokenResp);
-        throw e;
-    }
-
-    const accessToken  = tokenData.accessToken  || tokenData.access_token;
-    const refreshToken = tokenData.refreshToken || tokenData.refresh_token;
-    const idToken      = tokenData.idToken      || tokenData.id_token;
-
-    if (!accessToken || !refreshToken || !idToken) {
-        this.log.error("Token response incomplete");
-        this.log.error(tokenResp);
-        throw new Error("Token response incomplete");
-    }
-
-    this._accessToken   = accessToken;
-    this._refreshToken  = refreshToken;
-    this._idToken       = idToken;
-
-    this.config.atoken  = accessToken;
-    this.config.rtoken  = refreshToken;
-    this.config.idtoken = idToken;
-
-    this.log.info("Login successful");
-    return true;
-}
 
 
 
     updateStatus() {
         this.vinArray.forEach((vin) => {
             if (vin === this.currSession.vin) {
-                this.getIdStatus(vin).catch(() => {
-                    this.log.error("get id status Failed");
-                    this.refreshIDToken().catch(() => { });
+                this.getIdStatus(vin).catch((err) => {
+                    this.log.error("get id status Failed: " + err);
                 });
-                this.getIdParkingPosition(vin).catch(() => {
-                    this.log.error("get id parking position Failed");
+                this.getIdParkingPosition(vin).catch((err) => {
+                    this.log.error("get id parking position Failed: " + err);
                 });
             }
         });
     }
+
 
     getPersonalData() {
         return new Promise((resolve) => {
@@ -1558,123 +1631,172 @@ class VwWeConnect {
         this.log.debug("END populateConfig");
     }
 
-    getIdStatus(vin) {
-        return new Promise((resolve, reject) => {
-            this.log.debug("START getIdStatus");
-            request.get(
-                {
-                    url:
-                        "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" +
-                        vin +
-                        "/selectivestatus?jobs=access,activeVentilation,auxiliaryHeating,batteryChargingCare,batterySupport,charging,chargingProfiles,climatisation,climatisationTimers,departureProfiles,fuelStatus,honkAndFlash,hybridCarAuxiliaryHeating,userCapabilities,vehicleHealthWarnings,vehicleHealthInspection,vehicleLights,measurements,departureTimers",
-                    headers: {
-                        accept: "*/*",
-                        "content-type": "application/json",
-                        "content-version": "1",
-                        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-                        "user-agent": this.userAgent,
-                        "accept-language": "de-de",
-                        authorization: "Bearer " + this.config.atoken
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode);
-                        reject(err || new Error("getIdStatus failed"));
-                        return;
-                    }
+    async getIdStatus(vin) {
+        this.log.debug("[IDStatus] START getIdStatus for VIN " + vin);
 
-                    if (typeof this.idData !== "undefined") {
-                        this.idDataOld = this.idData;
-                    }
+        const url =
+            "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" +
+            vin +
+            "/selectivestatus?jobs=access,activeVentilation,auxiliaryHeating,batteryChargingCare,batterySupport,charging,chargingProfiles,climatisation,climatisationTimers,departureProfiles,fuelStatus,honkAndFlash,hybridCarAuxiliaryHeating,userCapabilities,vehicleHealthWarnings,vehicleHealthInspection,vehicleLights,measurements,departureTimers";
 
-                    this.idData = body;
+        const headers = {
+            accept: "*/*",
+            "content-type": "application/json",
+            "content-version": "1",
+            "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
+            "user-agent": this.userAgent,
+            "accept-language": "de-de",
+            authorization: "Bearer " + this.config.atoken
+        };
 
-                    if (typeof this.idData !== "undefined") {
-                        if (this.config.pendingRequests === 0) {
-                            this.populateConfig();
-                        }
-                    }
+        const callOnce = async () => {
+            return this._req({
+                method: "GET",
+                url,
+                headers,
+                followAllRedirects: true,
+                gzip: true,
+                json: true
+            });
+        };
 
-                    if (typeof this.idParkingPosition !== "undefined") {
-                        this.idData.parking = {};
-                        Object.assign(this.idData.parking, this.idParkingPosition);
-                    }
+        try {
+            // eerste poging
+            let { resp, body } = await callOnce();
 
-                    this.runEventEmitters();
+            if (resp.statusCode === 401) {
+                this.log.warn("[IDStatus] 401 → performing full login()");
+                await this._loginOnceGuarded("getIdStatus 401");
 
-                    this.boolFinishIdData = true;
+                // tweede poging na login
+                ({ resp, body } = await callOnce());
 
-                    resolve();
+                if (resp.statusCode === 401) {
+                    this.log.error("[IDStatus] 401 again after relogin → giving up");
+                    throw new Error("auth-failed");
                 }
-            );
-            this.log.debug("END getIdStatus");
-        });
+            }
+
+            if (resp.statusCode >= 400) {
+                this.log.error("[IDStatus] HTTP " + resp.statusCode);
+                this.log.error("[IDStatus] Body: " + JSON.stringify(body));
+                throw new Error("getIdStatus HTTP " + resp.statusCode);
+            }
+
+            if (typeof body !== "object" || body === null) {
+                this.log.error("[IDStatus] Invalid JSON body");
+                throw new Error("invalid-json");
+            }
+
+            if (this.idData) {
+                this.idDataOld = this.idData;
+            }
+
+            this.idData = body;
+
+            // parking info erbij plakken indien bekend
+            if (this.idParkingPosition) {
+                this.idData.parking = { ...this.idParkingPosition };
+            }
+
+            await this.runEventEmitters();
+            this.boolFinishIdData = true;
+
+            this.log.debug("[IDStatus] Success for VIN " + vin);
+        } catch (err) {
+            this.log.error("[IDStatus] Error: " + err);
+            throw err;
+        }
     }
 
-    getIdParkingPosition(vin) {
+
+
+
+    async getIdParkingPosition(vin) {
         if (!this.hasParkingPosition(vin)) {
-            this.log.debug(
-                "VIN " + vin + " has no parkingPosition capability"
-            );
-            return Promise.resolve(null);
+            this.log.debug("[Parking] VIN " + vin + " has no parkingPosition capability");
+            return;
         }
 
-        return new Promise((resolve, reject) => {
-            this.log.debug("START getIdParkingPosition");
-            request.get(
-                {
-                    url:
-                        "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" +
-                        vin +
-                        "/parkingposition",
-                    headers: {
-                        accept: "*/*",
-                        "content-type": "application/json",
-                        "content-version": "1",
-                        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-                        "user-agent": this.userAgent,
-                        "accept-language": "de-de",
-                        authorization: "Bearer " + this.config.atoken
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode);
-                        reject(err || new Error("getIdParkingPosition failed"));
-                        return;
-                    }
-                    this.log.debug(
-                        "getIdParkingPosition: " + JSON.stringify(body)
-                    );
-                    if (typeof body !== "undefined") {
-                        this.idParkingPosition = body;
-                        this.idParkingPosition.data.carIsParked = true;
-                    } else {
-                        this.idParkingPosition = {
-                            data: { carIsParked: false }
-                        };
-                    }
+        const url =
+            "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" +
+            vin +
+            "/parkingposition";
 
-                    resolve();
+        const headers = {
+            accept: "*/*",
+            "content-type": "application/json",
+            "content-version": "1",
+            "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
+            "user-agent": this.userAgent,
+            "accept-language": "de-de",
+            authorization: "Bearer " + this.config.atoken
+        };
+
+        const callOnce = async () => {
+            return this._req({
+                method: "GET",
+                url,
+                headers,
+                followAllRedirects: true,
+                gzip: true,
+                json: true
+            });
+        };
+
+        try {
+            this.log.debug("[Parking] GET " + url);
+
+            // eerste poging
+            let { resp, body } = await callOnce();
+
+            if (resp.statusCode === 401) {
+                this.log.warn("[Parking] 401 → performing full login()");
+                await this._loginOnceGuarded("getIdParkingPosition 401");
+
+                // tweede poging na login
+                ({ resp, body } = await callOnce());
+
+                if (resp.statusCode === 401) {
+                    this.log.error("[Parking] 401 again after relogin → giving up");
+                    throw new Error("auth-failed");
                 }
-            );
-            this.log.debug("END getIdParkingPosition");
-        });
+            }
+
+            if (resp.statusCode >= 400) {
+                this.log.error("[Parking] HTTP " + resp.statusCode);
+                this.log.error("[Parking] Body: " + JSON.stringify(body));
+                throw new Error("getIdParkingPosition HTTP " + resp.statusCode);
+            }
+
+            if (!body) {
+                this.log.error("[Parking] Empty body");
+                this.idParkingPosition = { data: { carIsParked: false } };
+                return;
+            }
+
+            this.idParkingPosition = body;
+            if (!this.idParkingPosition.data) {
+                this.idParkingPosition.data = {};
+            }
+            this.idParkingPosition.data.carIsParked = true;
+
+            this.log.debug("[Parking] Success for VIN " + vin);
+        } catch (err) {
+            this.log.error("[Parking] Error: " + err);
+            throw err;
+        }
     }
 
-    setIdRemote(vin, action, value, bodyContent) {
+
+
+
+    setIdRemote(vin, action, value, bodyContent, isRetry = false) {
         return new Promise((resolve, reject) => {
-            this.log.debug("setIdRemote >>");
+            this.log.debug("setIdRemote >> " + action + "/" + value + " (retry=" + isRetry + ")");
+
             let body = bodyContent || {};
+
             if (action === "climatisation" && value === "settings") {
                 const climateStates =
                     this.idData.climatisation.climatisationSettings.value;
@@ -1745,6 +1867,7 @@ class VwWeConnect {
                     0
                 );
             }
+
             if (action === "charging" && value === "settings") {
                 const chargingStates =
                     this.idData.charging.chargingSettings.value;
@@ -1783,6 +1906,7 @@ class VwWeConnect {
                     0
                 );
             }
+
             let method = "POST";
             if (value === "settings" || action === "destinations") {
                 method = "PUT";
@@ -1802,9 +1926,10 @@ class VwWeConnect {
                     "/" +
                     action;
             }
-            this.log.debug(urlString);
 
-            this.log.debug("setIdRemote: " + JSON.stringify(body));
+            this.log.debug("setIdRemote URL: " + urlString);
+            this.log.debug("setIdRemote body: " + JSON.stringify(body));
+
             request(
                 {
                     method,
@@ -1826,20 +1951,40 @@ class VwWeConnect {
                 (err, resp, bodyResp) => {
                     if (err || (resp && resp.statusCode >= 400)) {
                         if (resp && resp.statusCode === 401) {
-                            err && this.log.error(err);
-                            resp &&
-                                this.log.error(
-                                    resp.statusCode.toString()
-                                );
-                            bodyResp &&
-                                this.log.error(
-                                    JSON.stringify(bodyResp)
-                                );
-                            this.refreshIDToken().catch(() => { });
-                            this.log.error("Refresh Token");
-                            reject(err || new Error("401"));
+                            this.log.warn(
+                                "[setIdRemote] 401 for " +
+                                action +
+                                "/" +
+                                value +
+                                (isRetry ? " after retry" : "")
+                            );
+
+                            if (isRetry) {
+                                this.log.error("[setIdRemote] 401 after relogin → giving up");
+                                err && this.log.error(err);
+                                bodyResp &&
+                                    this.log.error(JSON.stringify(bodyResp));
+                                reject(err || new Error("401 after retry"));
+                                return;
+                            }
+
+                            // één keer een full login en daarna retry
+                            this._loginOnceGuarded("setIdRemote 401")
+                                .then(() => {
+                                    this.setIdRemote(vin, action, value, bodyContent, true)
+                                        .then(resolve)
+                                        .catch(reject);
+                                })
+                                .catch((loginErr) => {
+                                    this.log.error(
+                                        "[setIdRemote] Login failed during 401 handling: " +
+                                        loginErr
+                                    );
+                                    reject(loginErr);
+                                });
                             return;
                         }
+
                         err && this.log.error(err);
                         resp &&
                             this.log.error(resp.statusCode.toString());
@@ -1848,8 +1993,9 @@ class VwWeConnect {
                         reject(err || new Error("setIdRemote failed"));
                         return;
                     }
+
                     try {
-                        this.log.debug(JSON.stringify(bodyResp));
+                        this.log.debug("setIdRemote response: " + JSON.stringify(bodyResp));
                         resolve();
                     } catch (e) {
                         this.log.error(e);
@@ -1859,104 +2005,6 @@ class VwWeConnect {
             );
         });
     }
-
-    refreshIDToken() {
-        return new Promise((resolve, reject) => {
-            this.log.debug("Token refresh started");
-
-            request.get(
-                {
-                    url: "https://emea.bff.cariad.digital/user-login/refresh/v1",
-                    headers: {
-                        accept: "*/*",
-                        "content-type": "application/json",
-                        "content-version": "1",
-                        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-                        "user-agent": this.userAgent,
-                        "accept-language": "de-de",
-                        authorization: "Bearer " + this.config.rtoken,
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true,
-                },
-                async (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        const status = resp && resp.statusCode;
-                        if (status) {
-                            this.log.error("Token refresh failed with status " + status);
-                        } else {
-                            this.log.error("Token refresh failed");
-                        }
-                        err && this.log.error(err);
-                        body && this.log.error(JSON.stringify(body));
-
-                        // Python-achtig gedrag: bij 4xx (bijv. scope-mismatch 400 of 401/403) is refresh token ongeldig -> full login
-                        if (status >= 400 && status < 500) {
-                            this.log.error("Refresh token invalid or expired, trying full login");
-                            try {
-                                await this.login();
-                                this.log.info("Full login after refresh failure succeeded");
-                                resolve();
-                                return;
-                            } catch (e) {
-                                this.log.error("Full login after refresh failure also failed");
-                                this.log.error(e);
-                                reject(e);
-                                return;
-                            }
-                        }
-
-                        // 5xx -> tijdelijk probleem, caller kan later opnieuw proberen
-                        this.log.error("Temporary error during token refresh, will not schedule restart automatically");
-                        reject(err || new Error("Token refresh failed with status " + status));
-                        return;
-                    }
-
-                    try {
-                        this.log.debug("Token refresh successful");
-
-                        // body is al een object (json: true)
-                        const newAccess =
-                            body.accessToken ||
-                            body.access_token ||
-                            null;
-                        const newRefresh =
-                            body.refreshToken ||
-                            body.refresh_token ||
-                            null;
-
-                        if (newAccess) {
-                            this.config.atoken = newAccess;
-                        } else {
-                            this.log.debug("No new access token in refresh response, keeping existing one");
-                        }
-
-                        if (newRefresh) {
-                            this.config.rtoken = newRefresh;
-                        } else {
-                            this.log.debug("No new refresh token in refresh response, keeping existing one");
-                        }
-
-                        if (this.type === "Wc") {
-                            // Wallcharging relogin (oude behaviour)
-                            this.login().catch((loginErr) => {
-                                this.log.debug("Not able to login in WeCharge after refresh");
-                                this.log.debug(loginErr);
-                            });
-                        }
-
-                        resolve();
-                    } catch (e) {
-                        this.log.error("Error handling token refresh response");
-                        this.log.error(e);
-                        reject(e);
-                    }
-                }
-            );
-        });
-    }
-
 
     hasParkingPosition(vin) {
         const list = Array.isArray(this.vehicles)
