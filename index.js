@@ -146,7 +146,6 @@ class VwWeConnect {
         if (this.vinArray.includes(pVin)) {
             this.currSession.vin = pVin;
             this.log.info("Active VIN successfully set to <" + this.currSession.vin + ">.");
-            this.setDatabase("10.55.0.1");
         } else {
             this.log.error(
                 "VIN <" + pVin + "> is unknown. Active VIN is still <" + this.currSession.vin + ">."
