@@ -1,14 +1,10 @@
 "use strict";
 
-// latest checked version of ioBroker.vw-connect: latest // https://github.com/TA2k/ioBroker.vw-connect/commit/604cdc1aacee0d13f189829aed985f35281f2016
-var EventEmitter = require('events').EventEmitter;
-
+// Cleaned VW WeConnect ID API (BFF-based, no legacy WeCharge / MBB / FS-Car flows)
+const EventEmitter = require("events").EventEmitter;
 const request = require("request");
-const crypto = require("crypto");
-const { Crypto } = require("@peculiar/webcrypto");
-const { v4: uuidv4 } = require("uuid");
-const traverse = require("traverse");
-const express = require('express');
+const express = require("express");
+const mysql = require("mysql2");
 
 module.exports.idStatusEmitter = new EventEmitter();
 module.exports.idLogEmitter = new EventEmitter();
@@ -28,16 +24,16 @@ class Log {
         this.logTargetExternal = pExternal;
     }
     debug(pMessage) {
-        if (this.logLevel == "DEBUG") {
+        if (this.logLevel === "DEBUG") {
             if (this.logTargetExternal) {
-            module.exports.idLogEmitter.emit("DEBUG", pMessage);
+                module.exports.idLogEmitter.emit("DEBUG", pMessage);
             } else {
                 console.log("DEBUG: " + pMessage);
             }
         }
     }
     error(pMessage) {
-        if (this.logLevel != "NONE") {
+        if (this.logLevel !== "NONE") {
             if (this.logTargetExternal) {
                 module.exports.idLogEmitter.emit("ERROR", pMessage);
             } else {
@@ -46,7 +42,7 @@ class Log {
         }
     }
     info(pMessage) {
-        if (this.logLevel == "DEBUG" || this.logLevel == "INFO") {
+        if (this.logLevel === "DEBUG" || this.logLevel === "INFO") {
             if (this.logTargetExternal) {
                 module.exports.idLogEmitter.emit("INFO", pMessage);
             } else {
@@ -55,7 +51,11 @@ class Log {
         }
     }
     warn(pMessage) {
-        if (this.logLevel == "DEBUG" || this.logLevel == "INFO" || this.logLevel == "WARN") {
+        if (
+            this.logLevel === "DEBUG" ||
+            this.logLevel === "INFO" ||
+            this.logLevel === "WARN"
+        ) {
             if (this.logTargetExternal) {
                 module.exports.idLogEmitter.emit("WARN", pMessage);
             } else {
@@ -88,121 +88,52 @@ class VwWeConnect {
         pendingRequests: 0,
         historyLimit: 100,
         chargerOnly: false,
-        backendError: false
-    }
+        backendError: false,
+        db: null,
+        checkSafeStatusTimeout: 5
+    };
 
     currSession = {
         vin: "n/a"
-    }
+    };
 
     constructor() {
         this.boolFinishIdData = false;
-        this.boolFinishHomecharging = false;
-        this.boolFinishChargeAndPay = false;
-        this.boolFinishStations = false;
         this.boolFinishVehicles = false;
-        this.boolFinishCarData = false;
 
         this.log = new Log(this.config.logLevel);
         this.jar = request.jar();
-        this.userAgent = "ioBroker v47";
+        this.userAgent = "Volkswagen/3.51.1-android/14";
 
-        this.refreshTokenInterval = null;
-        this.vwrefreshTokenInterval = null;
+        // NEW: guarded login state
+        this.isLoggingIn = false;
+        this.loginPromise = null;
+
         this.updateInterval = null;
-        this.fupdateInterval = 0; // set force update interval to 0 => deactivated;
-        this.refreshTokenTimeout = null;
-
-        this.homeRegion = {};
-        this.homeRegionSetter = {};
 
         this.vinArray = [];
         this.etags = {};
-
-        this.statesArray = [
-            {
-                url: "$homeregion/fs-car/bs/departuretimer/v1/$type/$country/vehicles/$vin/timer",
-                path: "timer",
-                element: "timer",
-            },
-            {
-                url: "$homeregion/fs-car/bs/climatisation/v1/$type/$country/vehicles/$vin/climater",
-                path: "climater",
-                element: "climater",
-            },
-            {
-                url: "$homeregion/fs-car/bs/cf/v1/$type/$country/vehicles/$vin/position",
-                path: "position",
-                element: "storedPositionResponse",
-                element2: "position",
-                element3: "findCarResponse",
-                element4: "Position",
-            },
-            {
-                url: "$homeregion/fs-car/bs/tripstatistics/v1/$type/$country/vehicles/$vin/tripdata/$tripType?type=list",
-                path: "tripdata",
-                element: "tripDataList",
-            },
-            {
-                url: "$homeregion/fs-car/bs/vsr/v1/$type/$country/vehicles/$vin/status",
-                path: "status",
-                element: "StoredVehicleDataResponse",
-                element2: "vehicleData",
-            },
-            {
-                url: "$homeregion/fs-car/destinationfeedservice/mydestinations/v1/$type/$country/vehicles/$vin/destinations",
-                path: "destinations",
-                element: "destinations",
-            },
-            {
-                url: "$homeregion/fs-car/bs/batterycharge/v1/$type/$country/vehicles/$vin/charger",
-                path: "charger",
-                element: "charger",
-            },
-            {
-                url: "$homeregion/fs-car/bs/rs/v1/$type/$country/vehicles/$vin/status",
-                path: "remoteStandheizung",
-                element: "statusResponse",
-            },
-            {
-                url: "$homeregion/fs-car/bs/dwap/v1/$type/$country/vehicles/$vin/history",
-                path: "history",
-            },
-        ];
     }
 
     finishedReading() {
-        //  this.log.debug(" Id/SkodaE: " + this.boolFinishIdData +
-        //                " HomeCharge: " + this.boolFinishHomecharging +
-        //                " ChargePay: " + this.boolFinishChargeAndPay +
-        //                 " Stat: " + this.boolFinishStations +
-        //                 " Car: " + this.boolFinishCarData +
-        //                 " Vehic: " + this.boolFinishVehicles);
-        return (this.boolFinishIdData || this.config.chargerOnly)
-            //          && this.boolFinishHomecharging
-            //          && this.boolFinishChargeAndPay
-            //          && this.boolFinishStations
-            /*&& this.boolFinishCarData*/
-            && this.boolFinishVehicles;
+        return (
+            (this.boolFinishIdData || this.config.chargerOnly) &&
+            this.boolFinishVehicles
+        );
     }
 
     setCredentials(pUser, pPass) {
-        //this.config.userid = 0;
         this.config.user = pUser;
         this.config.password = pPass;
-        //this.config.type = "id";
         this.config.interval = 0.5;
-        this.config.checkSafeStatusTimeout = 5; // minutes to wait for event if car is not locked or windows not closed
-        //this.config.forceinterval = 360; // shouldn't be smaller than 360mins, default 0 (off)
-        //this.config.numberOfTrips = 1;
+        this.config.checkSafeStatusTimeout = 5; // minutes
     }
 
     setConfig(pType) {
-        if (pType == "idCharger") {
+        if (pType === "idCharger") {
             this.config.type = "id";
             this.config.chargerOnly = true;
-        }
-        else {
+        } else {
             this.config.type = pType;
         }
     }
@@ -215,44 +146,60 @@ class VwWeConnect {
         if (this.vinArray.includes(pVin)) {
             this.currSession.vin = pVin;
             this.log.info("Active VIN successfully set to <" + this.currSession.vin + ">.");
+            this.setDatabase("10.55.0.1");
         } else {
-            this.log.error("VIN <" + pVin + "> is unknown. Active VIN is still <" + this.currSession.vin + ">.");
+            this.log.error(
+                "VIN <" + pVin + "> is unknown. Active VIN is still <" + this.currSession.vin + ">."
+            );
         }
     }
 
+    setDatabase(pHost) {
+        this.config.db = mysql.createPool({
+            host: pHost,
+            user: this.config.user,
+            password: this.config.password,
+            database: "weconnect",
+            waitForConnections: true,
+            connectionLimit: 10
+        });
+    }
+
     restart() {
-        // dummy
+        // hook for external restart logic if needed
     }
 
     stopCharging() {
-        return new Promise(async (resolve, reject) => {
+        return new Promise((resolve, reject) => {
             this.log.debug("stopCharging >>");
             this.setIdRemote(this.currSession.vin, "charging", "stop", "")
                 .then(() => {
                     this.log.debug("stopCharging successful");
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("stopCharging failed");
-                    reject();
-                    return;
+                    reject(error);
                 });
             this.log.debug("stopCharging <<");
         });
     }
 
     setChargingSetting(setting, value) {
-        return new Promise(async (resolve, reject) => {
+        return new Promise((resolve, reject) => {
             this.log.debug("setChargerSetting " + setting + " to " + value + " >>");
             if (!this.finishedReading()) {
-                this.log.info("Reading necessary data not finished yet. Please try again.");
-                reject();
+                this.log.info(
+                    "Reading necessary data not finished yet. Please try again."
+                );
+                reject(new Error("Data not ready"));
                 return;
             }
             if (!this.vinArray.includes(this.currSession.vin)) {
-                this.log.error("Unknown VIN, aborting. Use setActiveVin to set a valid VIN.");
-                reject();
+                this.log.error(
+                    "Unknown VIN, aborting. Use setActiveVin to set a valid VIN."
+                );
+                reject(new Error("Unknown VIN"));
                 return;
             }
 
@@ -262,15 +209,27 @@ class VwWeConnect {
                         this.config.pendingRequests++;
                         this.config.targetSOC = value;
                     } else {
-                        this.log.debug("setChargerSetting " + setting + " value " + value + " out of bounds >>");
+                        this.log.debug(
+                            "setChargerSetting " +
+                            setting +
+                            " value " +
+                            value +
+                            " out of bounds >"
+                        );
                     }
                     break;
                 case "chargeCurrent":
-                    if (value == "maximum" || value == "reduced") {
+                    if (value === "maximum" || value === "reduced") {
                         this.config.pendingRequests++;
                         this.config.chargeCurrent = value;
                     } else {
-                        this.log.debug("setChargerSetting " + setting + " incorrect value " + value + "  >>");
+                        this.log.debug(
+                            "setChargerSetting " +
+                            setting +
+                            " incorrect value " +
+                            value +
+                            "  >>"
+                        );
                     }
                     break;
                 case "autoUnlockPlug":
@@ -278,78 +237,100 @@ class VwWeConnect {
                     this.config.autoUnlockPlug = value;
                     break;
                 default:
-                    this.log.debug("setChargerSetting " + setting + " not implemented" + " >>");
+                    this.log.debug(
+                        "setChargerSetting " + setting + " not implemented" + " >>"
+                    );
                     break;
             }
 
             this.setIdRemote(this.currSession.vin, "charging", "settings")
                 .then(() => {
                     this.log.info("setIdRemote succeeded");
-                    this.config.pendingRequests = Math.max(this.config.pendingRequests - 1, 0);
+                    this.config.pendingRequests = Math.max(
+                        this.config.pendingRequests - 1,
+                        0
+                    );
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("setIdRemote failed");
                     this.config.pendingRequests = 0;
-                    reject();
-                    return;
+                    reject(error);
                 });
             this.log.debug("setChargerSettings <<");
         });
     }
 
     setChargingSettings(pTargetSOC, pChargeCurrent) {
-        return new Promise(async (resolve, reject) => {
-            this.log.debug("setChargerSettings TargetSOC to " + pTargetSOC + "%, chargeCurrent to " + pChargeCurrent + " >>");
+        return new Promise((resolve, reject) => {
+            this.log.debug(
+                "setChargerSettings TargetSOC to " +
+                pTargetSOC +
+                "%, chargeCurrent to " +
+                pChargeCurrent +
+                " >>"
+            );
             if (!this.finishedReading()) {
-                this.log.info("Reading necessary data not finished yet. Please try again.");
-                reject();
+                this.log.info(
+                    "Reading necessary data not finished yet. Please try again."
+                );
+                reject(new Error("Data not ready"));
                 return;
             }
             if (!this.vinArray.includes(this.currSession.vin)) {
-                this.log.error("Unknown VIN, aborting. Use setActiveVin to set a valid VIN.");
-                reject();
+                this.log.error(
+                    "Unknown VIN, aborting. Use setActiveVin to set a valid VIN."
+                );
+                reject(new Error("Unknown VIN"));
                 return;
             }
             if (pTargetSOC >= 50 && pTargetSOC <= 100) {
                 this.config.pendingRequests++;
                 this.config.targetSOC = pTargetSOC;
             }
-            if (pChargeCurrent == "maximum" || pChargeCurrent == "reduced") {
+            if (pChargeCurrent === "maximum" || pChargeCurrent === "reduced") {
                 this.config.pendingRequests++;
                 this.config.chargeCurrent = pChargeCurrent;
             }
 
             this.setIdRemote(this.currSession.vin, "charging", "settings")
                 .then(() => {
-                    this.log.info("Target SOC set to " + this.config.targetSOC + "%.");
-                    this.log.info("Charging current set to " + this.config.chargeCurrent + ".");
-                    this.config.pendingRequests = Math.max(this.config.pendingRequests - 1, 0);
+                    this.log.info(
+                        "Target SOC set to " + this.config.targetSOC + "%."
+                    );
+                    this.log.info(
+                        "Charging current set to " + this.config.chargeCurrent + "."
+                    );
+                    this.config.pendingRequests = Math.max(
+                        this.config.pendingRequests - 1,
+                        0
+                    );
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("setting SOC and charge current failed");
                     this.config.pendingRequests = 0;
-                    reject();
-                    return;
+                    reject(error);
                 });
             this.log.debug("setChargerSettings <<");
         });
     }
 
     startCharging() {
-        return new Promise(async (resolve, reject) => {
+        return new Promise((resolve, reject) => {
             this.log.debug("startCharging >>");
             if (!this.finishedReading()) {
-                this.log.info("Reading necessary data not finished yet. Please try again.");
-                reject();
+                this.log.info(
+                    "Reading necessary data not finished yet. Please try again."
+                );
+                reject(new Error("Data not ready"));
                 return;
             }
             if (!this.vinArray.includes(this.currSession.vin)) {
-                this.log.error("Unknown VIN, aborting. Use setActiveVin to set a valid VIN.");
-                reject();
+                this.log.error(
+                    "Unknown VIN, aborting. Use setActiveVin to set a valid VIN."
+                );
+                reject(new Error("Unknown VIN"));
                 return;
             }
 
@@ -357,12 +338,10 @@ class VwWeConnect {
                 .then(() => {
                     this.log.debug("startCharging successful");
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("startCharging failed");
-                    reject();
-                    return;
+                    reject(error);
                 });
 
             this.log.debug("startCharging <<");
@@ -370,52 +349,54 @@ class VwWeConnect {
     }
 
     stopClimatisation() {
-        return new Promise(async (resolve, reject) => {
+        return new Promise((resolve, reject) => {
             this.log.debug("stopClimatisation >>");
             this.setIdRemote(this.currSession.vin, "climatisation", "stop", "")
                 .then(() => {
                     this.log.debug("stopClimatisation successful");
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("stopClimatisation failed");
-                    reject();
-                    return;
+                    reject(error);
                 });
             this.log.debug("stopClimatisation <<");
         });
     }
 
     setDestination(destination) {
-        return new Promise(async (resolve, reject) => {
+        return new Promise((resolve, reject) => {
             this.log.debug("setDestination >>");
             this.setIdRemote(this.currSession.vin, "destinations", "", destination)
                 .then(() => {
                     this.log.debug("setDestination successful");
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("setDestination failed");
-                    reject();
-                    return;
+                    reject(error);
                 });
             this.log.debug("setDestination <<");
         });
     }
 
     startClimatisation() {
-        return new Promise(async (resolve, reject) => {
-            this.log.debug("startClimatisation with " + this.config.targetTempC + "°C >>");
+        return new Promise((resolve, reject) => {
+            this.log.debug(
+                "startClimatisation with " + this.config.targetTempC + "°C >>"
+            );
             if (!this.finishedReading()) {
-                this.log.info("Reading necessary data not finished yet. Please try again.");
-                reject();
+                this.log.info(
+                    "Reading necessary data not finished yet. Please try again."
+                );
+                reject(new Error("Data not ready"));
                 return;
             }
             if (!this.vinArray.includes(this.currSession.vin)) {
-                this.log.error("Unknown VIN, aborting. Use setActiveVin to set a valid VIN.");
-                reject();
+                this.log.error(
+                    "Unknown VIN, aborting. Use setActiveVin to set a valid VIN."
+                );
+                reject(new Error("Unknown VIN"));
                 return;
             }
 
@@ -423,72 +404,96 @@ class VwWeConnect {
                 .then(() => {
                     this.log.debug("startClimatisation successful");
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("startClimatisation failed");
-                    reject();
-                    return;
+                    reject(error);
                 });
             this.log.debug("startClimatisation <<");
         });
     }
 
     setClimatisationSetting(pSetting, pValue) {
-        return new Promise(async (resolve, reject) => {
-            this.log.debug("setClimatisationSetting with " + pSetting + " " + pValue + " >>");
+        return new Promise((resolve, reject) => {
+            this.log.debug(
+                "setClimatisationSetting with " +
+                pSetting +
+                " " +
+                pValue +
+                " >>"
+            );
             if (!this.finishedReading()) {
-                this.log.info("Reading necessary data not finished yet. Please try again.");
-                reject();
+                this.log.info(
+                    "Reading necessary data not finished yet. Please try again."
+                );
+                reject(new Error("Data not ready"));
                 return;
             }
             if (!this.vinArray.includes(this.currSession.vin)) {
-                this.log.error("Unknown VIN, aborting. Use setActiveVin to set a valid VIN.");
-                reject();
+                this.log.error(
+                    "Unknown VIN, aborting. Use setActiveVin to set a valid VIN."
+                );
+                reject(new Error("Unknown VIN"));
                 return;
             }
 
             this.config.pendingRequests++;
             switch (pSetting) {
-                case "climatizationAtUnlock": this.config.climatizationAtUnlock = pValue; break;
-                case "climatisationWindowHeating": this.config.climatisationWindowHeating = pValue; break;
-                case "climatisationFrontLeft": this.config.climatisationFrontLeft = pValue; break;
-                case "climatisationFrontRight": this.config.climatisationFrontRight = pValue; break;
-                default: break;
+                case "climatizationAtUnlock":
+                    this.config.climatizationAtUnlock = pValue;
+                    break;
+                case "climatisationWindowHeating":
+                    this.config.climatisationWindowHeating = pValue;
+                    break;
+                case "climatisationFrontLeft":
+                    this.config.climatisationFrontLeft = pValue;
+                    break;
+                case "climatisationFrontRight":
+                    this.config.climatisationFrontRight = pValue;
+                    break;
+                default:
+                    break;
             }
 
             this.setIdRemote(this.currSession.vin, "climatisation", "settings", "")
                 .then(() => {
                     this.log.debug("setClimatisationSetting successful");
-                    this.config.pendingRequests = Math.max(this.config.pendingRequests - 1, 0);
+                    this.config.pendingRequests = Math.max(
+                        this.config.pendingRequests - 1,
+                        0
+                    );
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("setClimatisationSetting failed");
                     this.config.pendingRequests = 0;
-                    reject();
-                    return;
+                    reject(error);
                 });
             this.log.debug("setClimatisationSetting <<");
         });
     }
 
     setClimatisation(pTempC) {
-        return new Promise(async (resolve, reject) => {
+        return new Promise((resolve, reject) => {
             this.log.debug("setClimatisation with " + pTempC + "°C >>");
             if (!this.finishedReading()) {
-                this.log.info("Reading necessary data not finished yet. Please try again.");
-                reject();
+                this.log.info(
+                    "Reading necessary data not finished yet. Please try again."
+                );
+                reject(new Error("Data not ready"));
                 return;
             }
             if (!this.vinArray.includes(this.currSession.vin)) {
-                this.log.error("Unknown VIN, aborting. Use setActiveVin to set a valid VIN.");
-                reject();
+                this.log.error(
+                    "Unknown VIN, aborting. Use setActiveVin to set a valid VIN."
+                );
+                reject(new Error("Unknown VIN"));
                 return;
             }
             if (pTempC < 16 || pTempC > 27) {
-                this.log.info("Invalid temperature, setting 20°C as default");
+                this.log.info(
+                    "Invalid temperature, setting 20°C as default"
+                );
                 pTempC = 20;
             }
             this.config.pendingRequests++;
@@ -497,15 +502,16 @@ class VwWeConnect {
             this.setIdRemote(this.currSession.vin, "climatisation", "settings", "")
                 .then(() => {
                     this.log.debug("setClimatisation successful");
-                    this.config.pendingRequests = Math.max(this.config.pendingRequests - 1, 0);
+                    this.config.pendingRequests = Math.max(
+                        this.config.pendingRequests - 1,
+                        0
+                    );
                     resolve();
-                    return;
                 })
-                .catch(() => {
+                .catch((error) => {
                     this.log.error("setClimatisation failed");
                     this.config.pendingRequests = 0;
-                    reject();
-                    return;
+                    reject(error);
                 });
             this.log.debug("setClimatisation <<");
         });
@@ -518,8 +524,8 @@ class VwWeConnect {
 
     enableApi(port) {
         const app = express();
-        app.get('/status', (req, res) => {
-            if (typeof(this.idData) != "undefiend") {
+        app.get("/status", (req, res) => {
+            if (typeof this.idData !== "undefined") {
                 res.json(this.idData);
             } else {
                 res.status(200).end();
@@ -527,1025 +533,651 @@ class VwWeConnect {
         });
 
         app.listen(port, () => {
-            this.log.info(`API server is running on port ${port}`);
+            this.log.info("API server is running on port " + port);
         });
     }
 
     async getData() {
         this.boolFinishIdData = false;
-        this.boolFinishHomecharging = false;
-        this.boolFinishChargeAndPay = false;
-        this.boolFinishStations = false;
         this.boolFinishVehicles = false;
-        this.boolFinishCarData = false;
 
-        // resolve only after all the different calls have finished reading their data
-        // await promise at the end of this method
-        let promise = new Promise((resolve, reject) => {
+        if (this.config.interval === 0) {
+            this.log.info("Interval of 0 is not allowed, reset to 1");
+            this.config.interval = 1;
+        }
+
+        const donePromise = new Promise((resolve) => {
             const finishedReadingInterval = setInterval(() => {
                 if (this.finishedReading()) {
-                    clearInterval(finishedReadingInterval)
-                    resolve("done!");
-                } else {
+                    clearInterval(finishedReadingInterval);
+                    resolve("done");
                 }
-            }, 1000)
+            }, 1000);
         });
-
-        // Reset the connection indicator during startup
-        //         this.type = "VW";
-        //         this.country = "DE";
-        //         this.clientId = "9496332b-ea03-4091-a224-8c746b885068%40apps_vw-dilab_com";
-        //         this.xclientId = "38761134-34d0-41f3-9a73-c4be88d7d337";
-        //         this.scope = "openid%20profile%20mbb%20email%20cars%20birthdate%20badge%20address%20vin";
-        //         this.redirect = "carnet%3A%2F%2Fidentity-kit%2Flogin";
-        //         this.xrequest = "de.volkswagen.carnet.eu.eremote";
-        //         this.responseType = "id_token%20token%20code";
-        //         this.xappversion = "5.1.2";
-        //         this.xappname = "eRemote";
 
         this.type = "Id";
         this.country = "DE";
-        this.clientId = "a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com";
-        this.xclientId = "";
+        this.clientId =
+            "a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com";
         this.scope = "openid profile badge cars dealers birthdate vin";
         this.redirect = "weconnect://authenticated";
         this.xrequest = "com.volkswagen.weconnect";
         this.responseType = "code id_token token";
-        this.xappversion = "";
-        this.xappname = "";
 
-        if (this.config.interval === 0) {
-            this.log.info("Interval of 0 is not allowed reset to 1");
-            this.config.interval = 1;
-        }
-        this.tripTypes = [];
-        if (this.config.tripShortTerm == true) {
-            this.tripTypes.push("shortTerm");
-        }
-        if (this.config.tripLongTerm == true) {
-            this.tripTypes.push("longTerm");
-        }
-        if (this.config.tripCyclic == true) {
-            this.tripTypes.push("cyclic");
-        }
-        this.login()
-            .then(() => {
-                this.log.debug("Login successful");
-                this.getPersonalData()
-                    .then(() => {
-                        this.getVehicles()
-                            .then(() => {
-                                this.vinArray.forEach((vin) => {
-                                    this.getIdStatus(vin).catch(() => {
-                                        this.log.error("get id status Failed");
-                                    });
-                                    this.getIdParkingPosition(vin).catch(() => {
-                                        this.log.error("get id parking position Failed");
-                                    });
-                                });
+        try {
+            await this.login();
+            this.log.info("Login successful");
 
-                                this.updateInterval = setInterval(() => {
-                                    this.updateStatus();
-                                },
-                                    this.config.interval * 60 * 1000);
-                            })
-                            .catch(() => {
-                                this.log.error("Get Vehicles Failed");
-                            });
-                    })
-                    .catch(() => {
-                        this.log.error("get personal data Failed");
-                    });
-            })
-            .catch(() => {
-                this.log.error("Login Failed");
+            await this.getPersonalData();
+            await this.getVehicles();
+
+            this.vinArray.forEach((vin) => {
+                this.getIdStatus(vin).catch(() => {
+                    this.log.debug("get id status Failed");
+                });
+                this.getIdParkingPosition(vin).catch(() => {
+                    this.log.debug("get id parking position Failed");
+                });
             });
 
-        let result = await promise; // wait for the promise from the start to resolve
+            this.updateInterval = setInterval(() => {
+                this.updateStatus();
+            }, this.config.interval * 60 * 1000);
+        } catch (err) {
+            this.log.error("Login or initial data fetch failed");
+        }
+
+        await donePromise;
         this.log.debug("getData END");
     }
 
-    login() {
-        return new Promise(async (resolve, reject) => {
-            const nonce = this.getNonce();
-            const state = uuidv4();
-
-            let [code_verifier, codeChallenge] = this.getCodeChallenge();
-
-            const method = "GET";
-            const form = {};
-            let url =
-                "https://identity.vwgroup.io/oidc/v1/authorize?client_id=" +
-                this.clientId +
-                "&scope=" +
-                this.scope +
-                "&response_type=" +
-                this.responseType +
-                "&redirect_uri=" +
-                this.redirect +
-                "&nonce=" +
-                nonce +
-                "&state=" +
-                state;
-
-            if (this.config.type === "id" && this.type !== "Wc") {
-                url = await this.receiveLoginUrl().catch(() => {
-                    this.log.warn("Failed to get login url");
-                });
-                if (!url) {
-                    url = "https://emea.bff.cariad.digital/user-login/v1/authorize?nonce=" + this.randomString(16) + "&redirect_uri=weconnect://authenticated";
-                }
-            }
-            const loginRequest = request(
-                {
-                    method: method,
-                    url: url,
-                    headers: {
-                        "User-Agent": this.userAgent,
-                        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Accept-Encoding": "gzip, deflate",
-                        "x-requested-with": this.xrequest,
-                        "upgrade-insecure-requests": 1,
-                    },
-                    jar: this.jar,
-                    form: form,
-                    gzip: true,
-                    followAllRedirects: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        if (this.type === "Wc") {
-                            if (err && err.message === "Invalid protocol: wecharge:") {
-                                this.log.debug("Found WeCharge connection");
-                                this.getTokens(loginRequest, code_verifier, reject, resolve);
-                            } else {
-                                this.log.debug("No WeCharge found, cancel login");
-                                resolve();
-                            }
-                            return;
-                        }
-                        if (err && err.message.indexOf("Invalid protocol:") !== -1) {
-                            this.log.debug("Found Token");
-                            this.getTokens(loginRequest, code_verifier, reject, resolve);
-                            return;
-                        }
-                        this.log.error("Failed in first login step ");
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        body && this.log.error(JSON.stringify(body));
-                        err && err.message && this.log.error(err.message);
-
-                        loginRequest && loginRequest.uri && loginRequest.uri.query && this.log.debug(loginRequest.uri.query.toString());
-
-                        reject();
-                        return;
-                    }
-
-                    try {
-                        let form = {};
-                        if (body.indexOf("emailPasswordForm") !== -1) {
-                            this.log.debug("parseEmailForm");
-                            form = this.extractHidden(body);
-                            form["email"] = this.config.user;
-                        } else {
-                            this.log.error("No Login Form found for type: " + this.type);
-                            this.log.debug(JSON.stringify(body));
-                            reject();
-                            return;
-                        }
-                        request.post(
-                            {
-                                url: "https://identity.vwgroup.io/signin-service/v1/" + this.clientId + "/login/identifier",
-                                headers: {
-                                    "Content-Type": "application/x-www-form-urlencoded",
-                                    "User-Agent": this.userAgent,
-                                    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                    "Accept-Language": "en-US,en;q=0.9",
-                                    "Accept-Encoding": "gzip, deflate",
-                                    "x-requested-with": this.xrequest,
-                                },
-                                form: form,
-                                jar: this.jar,
-                                gzip: true,
-                                followAllRedirects: true,
-                            },
-                            (err, resp, body) => {
-                                if (err || (resp && resp.statusCode >= 400)) {
-                                    this.log.error("Failed to get login identifier");
-                                    err && this.log.error(err);
-                                    resp && this.log.error(resp.statusCode.toString());
-                                    body && this.log.error(JSON.stringify(body));
-                                    reject();
-                                    return;
-                                }
-                                try {
-                                    if (body.indexOf("emailPasswordForm") !== -1) {
-                                        this.log.debug("emailPasswordForm2");
-                                        /*
-                                        const stringJson =body.split("window._IDK = ")[1].split(";")[0].replace(/\n/g, "")
-                                        const json =stringJson.replace(/(['"])?([a-z0-9A-Z_]+)(['"])?:/g, '"$2": ').replace(/'/g, '"')
-                                        const jsonObj = JSON.parse(json);
-                                        */
-                                        form = {
-                                            _csrf: body.split("csrf_token: '")[1].split("'")[0],
-                                            email: this.config.user,
-                                            password: this.config.password,
-                                            hmac: body.split('"hmac":"')[1].split('"')[0],
-                                            relayState: body.split('"relayState":"')[1].split('"')[0],
-                                        };
-                                    } else {
-                                        this.log.error("No Login Form found. Please check your E-Mail in the app.");
-                                        this.log.debug(JSON.stringify(body));
-                                        reject();
-                                        return;
-                                    }
-                                    request.post(
-                                        {
-                                            url: "https://identity.vwgroup.io/signin-service/v1/" + this.clientId + "/login/authenticate",
-                                            headers: {
-                                                "Content-Type": "application/x-www-form-urlencoded",
-                                                "User-Agent": this.userAgent,
-                                                Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                "Accept-Language": "en-US,en;q=0.9",
-                                                "Accept-Encoding": "gzip, deflate",
-                                                "x-requested-with": this.xrequest,
-                                            },
-                                            form: form,
-                                            jar: this.jar,
-                                            gzip: true,
-                                            followAllRedirects: false,
-                                        },
-                                        (err, resp, body) => {
-                                            if (err || (resp && resp.statusCode >= 400)) {
-                                                this.log.error("Failed to get login authenticate");
-                                                err && this.log.error(err);
-                                                resp && this.log.error(resp.statusCode.toString());
-                                                body && this.log.error(JSON.stringify(body));
-                                                reject();
-                                                return;
-                                            }
-
-                                            try {
-                                                this.log.debug(JSON.stringify(body));
-                                                this.log.debug(JSON.stringify(resp.headers));
-
-                                                if (resp.headers.location.split("&").length <= 2 || resp.headers.location.indexOf("/terms-and-conditions?") !== -1) {
-                                                    this.log.warn(resp.headers.location);
-                                                    this.log.warn("No valid userid, please visit this link or logout and login in your app account:");
-                                                    this.log.warn("https://" + resp.request.host + resp.headers.location);
-                                                    this.log.warn("Try to auto accept new consent");
-
-                                                    request.get(
-                                                        {
-                                                            url: "https://" + resp.request.host + resp.headers.location,
-                                                            jar: this.jar,
-                                                            headers: {
-                                                                "User-Agent": this.userAgent,
-                                                                Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                                "Accept-Language": "en-US,en;q=0.9",
-                                                                "Accept-Encoding": "gzip, deflate",
-                                                                "x-requested-with": this.xrequest,
-                                                            },
-                                                            followAllRedirects: true,
-                                                            gzip: true,
-                                                        },
-                                                        (err, resp, body) => {
-                                                            this.log.debug(body);
-
-                                                            const form = this.extractHidden(body);
-                                                            const url = "https://" + resp.request.host + resp.req.path.split("?")[0];
-                                                            this.log.debug(JSON.stringify(form));
-
-                                                            request.post(
-                                                                {
-                                                                    url: url,
-                                                                    jar: this.jar,
-                                                                    headers: {
-                                                                        "Content-Type": "application/x-www-form-urlencoded",
-                                                                        "User-Agent": this.userAgent,
-                                                                        Accept:
-                                                                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                                        "Accept-Language": "en-US,en;q=0.9",
-                                                                        "Accept-Encoding": "gzip, deflate",
-                                                                        "x-requested-with": this.xrequest,
-                                                                    },
-                                                                    form: form,
-                                                                    followAllRedirects: true,
-                                                                    gzip: true,
-                                                                },
-                                                                (err, resp, body) => {
-                                                                    if ((err && err.message.indexOf("Invalid protocol:") !== -1) || (resp && resp.statusCode >= 400)) {
-                                                                        this.log.warn("Failed to auto accept");
-                                                                        err && this.log.error(err);
-                                                                        resp && this.log.error(resp.statusCode.toString());
-                                                                        body && this.log.error(JSON.stringify(body));
-                                                                        reject();
-                                                                        return;
-                                                                    }
-                                                                    this.log.info("Auto accept succesful. Restart adapter in 10sec");
-                                                                    setTimeout(() => {
-                                                                        this.restart();
-                                                                    }, 10 * 1000);
-                                                                }
-                                                            );
-                                                        }
-                                                    );
-
-                                                    reject();
-                                                    return;
-                                                }
-                                                this.config.userid = resp.headers.location.split("&")[2].split("=")[1];
-                                                if (!this.stringIsAValidUrl(resp.headers.location)) {
-                                                    if (resp.headers.location.indexOf("&error=") !== -1) {
-                                                        const location = resp.headers.location;
-                                                        this.log.error("Error: " + location.substring(location.indexOf("error="), location.length - 1));
-                                                    } else {
-                                                        this.log.error("No valid login url, please download the log and visit:");
-                                                        this.log.error("http://" + resp.request.host + resp.headers.location);
-                                                    }
-                                                    reject();
-                                                    return;
-                                                }
-
-                                                let getRequest = request.get(
-                                                    {
-                                                        url: resp.headers.location || "",
-                                                        headers: {
-                                                            "User-Agent": this.userAgent,
-                                                            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                            "Accept-Language": "en-US,en;q=0.9",
-                                                            "Accept-Encoding": "gzip, deflate",
-                                                            "x-requested-with": this.xrequest,
-                                                        },
-                                                        jar: this.jar,
-                                                        gzip: true,
-                                                        followAllRedirects: true,
-                                                    },
-                                                    (err, resp, body) => {
-                                                        if (err) {
-                                                            this.log.debug(err);
-                                                            this.getTokens(getRequest, code_verifier, reject, resolve);
-                                                        } else {
-                                                            this.log.debug(body);
-                                                            this.log.debug("No Token received visiting url and accept the permissions.");
-                                                            const form = this.extractHidden(body);
-                                                            getRequest = request.post(
-                                                                {
-                                                                    url: getRequest.uri.href,
-                                                                    headers: {
-                                                                        "Content-Type": "application/x-www-form-urlencoded",
-                                                                        "User-Agent": this.userAgent,
-                                                                        Accept:
-                                                                            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3",
-                                                                        "Accept-Language": "en-US,en;q=0.9",
-                                                                        "Accept-Encoding": "gzip, deflate",
-                                                                        "x-requested-with": this.xrequest,
-                                                                        referer: getRequest.uri.href,
-                                                                    },
-                                                                    form: form,
-                                                                    jar: this.jar,
-                                                                    gzip: true,
-                                                                    followAllRedirects: true,
-                                                                },
-                                                                (err, resp, body) => {
-                                                                    if (err) {
-                                                                        this.getTokens(getRequest, code_verifier, reject, resolve);
-                                                                    } else {
-                                                                        this.log.error("No Token received. Please try to logout and login in the VW app or select type VWv2 in the settings");
-                                                                        try {
-                                                                            this.log.debug(JSON.stringify(body));
-                                                                        } catch (err) {
-                                                                            this.log.error(err);
-                                                                            reject();
-                                                                        }
-                                                                    }
-                                                                }
-                                                            );
-                                                        }
-                                                    }
-                                                );
-                                            } catch (err2) {
-                                                this.log.error("Login was not successful, please check your login credentials and selected type");
-                                                err && this.log.error(err);
-                                                this.log.error(err2);
-                                                this.log.error(err2.stack);
-                                                reject();
-                                            }
-                                        }
-                                    );
-                                } catch (err) {
-                                    this.log.error(err);
-                                    reject();
-                                }
-                            }
-                        );
-                    } catch (err) {
-                        this.log.error(err);
-                        reject();
-                    }
-                }
-            );
-        });
-    }
-
-    updateStatus() {
-        this.vinArray.forEach((vin) => {
-            this.getIdStatus(vin).catch(() => {
-                this.log.error("get id status Failed");
-                this.refreshIDToken().catch(() => { });
-            });
-            this.getIdParkingPosition(vin).catch(() => {
-                this.log.error("get id parking position Failed");
-                this.refreshIDToken().catch(() => { });
-            });
-            //this.getWcData();
-        });
-        return;
-    }
-
-    receiveLoginUrl() {
+    _req(opts) {
         return new Promise((resolve, reject) => {
-            request(
-                {
-                    method: "GET",
-                    url: "https://emea.bff.cariad.digital/user-login/v1/authorize?nonce=" + this.randomString(16) + "&redirect_uri=weconnect://authenticated",
-                    headers: {
-                        Host: "emea.bff.cariad.digital",
-                        "user-agent": this.userAgent,
-                        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "accept-language": "de-de",
-                    },
-                    jar: this.jar,
-                    gzip: true,
-                    followAllRedirects: false,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        this.log.error("Failed in receive login url ");
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        body && this.log.error(JSON.stringify(body));
-                        reject();
-                        return;
-                    }
-                    resolve(resp.request.href);
-                }
-            );
+            request(opts, (err, resp, body) => {
+                if (err) return reject(err);
+                resolve({ resp, body });
+            });
         });
     }
 
-    replaceVarInUrl(url, vin, tripType) {
-        const curHomeRegion = this.homeRegion[vin];
-        return url
-            .replace("/$vin", "/" + vin + "")
-            .replace("$homeregion/", curHomeRegion + "/")
-            .replace("/$type/", "/" + this.type + "/")
-            .replace("/$country/", "/" + this.country + "/")
-            .replace("/$tripType", "/" + tripType);
-    }
+    async _handleConsentPage(url, jar) {
+        const adapter = this;
+        const ua = this.userAgent || "Volkswagen/3.51.1-android/14";
 
-    getTokens(getRequest, code_verifier, reject, resolve) {
-        let hash = "";
-        if (getRequest.uri.hash) {
-            hash = getRequest.uri.hash;
-        } else {
-            hash = getRequest.uri.query;
+        adapter.log.debug("[_handleConsentPage] GET " + url);
+
+        // GET the consent page
+        let { resp, body } = await this._req({
+            method: "GET",
+            url,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate"
+            }
+        });
+
+        const status = resp.statusCode;
+        if (status === 500) {
+            throw new Error("Temporary server error during consent flow");
         }
-        const hashArray = hash.split("&");
-        // eslint-disable-next-line no-unused-vars
-        let state;
-        let jwtauth_code;
-        let jwtaccess_token;
-        let jwtid_token;
-        let jwtstate;
-        hashArray.forEach((hash) => {
-            const harray = hash.split("=");
-            if (harray[0] === "#state" || harray[0] === "state") {
-                state = harray[1];
+        if (status !== 200) {
+            throw new Error("Unexpected status code during consent flow: " + status);
+        }
+
+        // Reuse your existing extractHidden() helper
+        const hiddenFields = this.extractHidden(body || "");
+        adapter.log.debug("[_handleConsentPage] Hidden fields: " + JSON.stringify(hiddenFields));
+
+        // Strip query from URL, like Python does
+        let postUrl = url;
+        try {
+            const u = new URL(url);
+            u.search = "";
+            postUrl = u.toString();
+        } catch (e) {
+            // fallback: strip by hand
+            const qIdx = url.indexOf("?");
+            if (qIdx >= 0) {
+                postUrl = url.substring(0, qIdx);
             }
-            if (harray[0] === "code") {
-                jwtauth_code = harray[1];
+        }
+
+        // Build x-www-form-urlencoded body from hidden fields
+        const formBody = Object.keys(hiddenFields)
+            .map(k => encodeURIComponent(k) + "=" + encodeURIComponent(hiddenFields[k]))
+            .join("&");
+
+        adapter.log.debug("[_handleConsentPage] POST consent to " + postUrl);
+
+        ({ resp, body } = await this._req({
+            method: "POST",
+            url: postUrl,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": ua,
+                "Accept": "*/*",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate"
+            },
+            body: formBody
+        }));
+
+        const postStatus = resp.statusCode;
+        if (postStatus === 500) {
+            throw new Error("Temporary server error during consent POST");
+        }
+        if (!(postStatus === 302 || postStatus === 303)) {
+            throw new Error("Forwarding expected (302/303) after consent POST, got " + postStatus);
+        }
+
+        const loc = resp.headers.location;
+        if (!loc) {
+            throw new Error("Forwarding without Location in consent response");
+        }
+
+        const nextUrl = new URL(loc, postUrl).toString();
+        adapter.log.debug("[_handleConsentPage] Next URL after consent: " + nextUrl);
+        return nextUrl;
+    }
+
+    async _handleNewAuthFlow(startUrl, jar) {
+        const adapter = this;
+        const ua = this.userAgent || "Volkswagen/3.51.1-android/14";
+
+        let url = startUrl;
+        let resp, body;
+
+        // === Initial fetch of authorization page (max 5 redirects) ===
+        let maxInitialRedirects = 5;
+        while (maxInitialRedirects > 0) {
+            // If we already got a custom scheme, just return it
+            if (url.startsWith("weconnect://")) {
+                adapter.log.debug("[_handleNewAuthFlow] Found custom scheme during initial fetch: " + url);
+                return url;
             }
-            if (harray[0] === "access_token") {
-                jwtaccess_token = harray[1];
+
+            adapter.log.debug("[_handleNewAuthFlow] GET " + url);
+
+            ({ resp, body } = await this._req({
+                method: "GET",
+                url,
+                jar,
+                followRedirect: false,
+                gzip: true,
+                headers: {
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate"
+                }
+            }));
+
+            const status = resp.statusCode;
+
+            if (status === 200) {
+                break;
             }
-            if (harray[0] === "id_token") {
-                jwtid_token = harray[1];
+
+            if (status === 302 || status === 303) {
+                const loc = resp.headers.location;
+                if (!loc) {
+                    throw new Error("Forwarding without Location in headers (initial auth fetch)");
+                }
+                url = new URL(loc, url).toString();
+                maxInitialRedirects--;
+                continue;
             }
-            if (harray[0] === "#state") {
-                jwtstate = harray[1];
+
+            throw new Error("Failed to fetch authorization page, status=" + status);
+        }
+
+        if (maxInitialRedirects === 0) {
+            throw new Error("Too many redirects while fetching authorization page");
+        }
+
+        // === Extract state token from HTML ===
+        const stateMatch = body && body.match(/<input[^>]*name="state"[^>]*value="([^"]*)"/);
+        const state = stateMatch && stateMatch[1];
+        if (!state) {
+            throw new Error("Could not find state token in authorization page");
+        }
+
+        // === POST username/password/state to /u/login?state=... ===
+        const loginUrl = "https://identity.vwgroup.io/u/login?state=" + encodeURIComponent(state);
+        const loginFormBody =
+            "username=" + encodeURIComponent(this.config.user) +
+            "&password=" + encodeURIComponent(this.config.password) +
+            "&state=" + encodeURIComponent(state);
+
+        adapter.log.debug("[_handleNewAuthFlow] POST credentials to " + loginUrl);
+
+        ({ resp, body } = await this._req({
+            method: "POST",
+            url: loginUrl,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": ua,
+                "Accept": "*/*",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate"
+            },
+            body: loginFormBody
+        }));
+
+        const statusLogin = resp.statusCode;
+        if (!(statusLogin === 302 || statusLogin === 303)) {
+            throw new Error("Login failed with status code: " + statusLogin);
+        }
+        if (!resp.headers.location) {
+            throw new Error("No Location header in login response");
+        }
+
+        let redirectUrl = resp.headers.location;
+        adapter.log.debug("[_handleNewAuthFlow] After-login redirect: " + redirectUrl);
+
+        // === Follow redirects until weconnect://authenticated... (max 10 redirects) ===
+        let maxDepth = 10;
+        while (maxDepth > 0) {
+            adapter.log.debug("[_handleNewAuthFlow] Redirect loop depth=" + maxDepth + " url=" + redirectUrl);
+
+            // Final callbacks
+            if (redirectUrl.startsWith("weconnect://authenticated")) {
+                adapter.log.debug("[_handleNewAuthFlow] Reached OAuth callback URL");
+                return redirectUrl;
+            }
+            if (redirectUrl.startsWith("weconnect://")) {
+                adapter.log.info("[_handleNewAuthFlow] Found custom scheme URL: " + redirectUrl);
+                return redirectUrl;
+            }
+
+            // Handle consent / terms-and-conditions pages (like Python)
+            if (redirectUrl.indexOf("terms-and-conditions") !== -1) {
+                adapter.log.info("[_handleNewAuthFlow] Detected terms-and-conditions page at: " + redirectUrl);
+                redirectUrl = await this._handleConsentPage(
+                    redirectUrl.startsWith("http")
+                        ? redirectUrl
+                        : "https://identity.vwgroup.io" + redirectUrl,
+                    jar
+                );
+                // After consent, continue the redirect loop with the new URL
+                maxDepth--;
+                continue;
+            }
+
+            const absUrl = redirectUrl.startsWith("http")
+                ? redirectUrl
+                : "https://identity.vwgroup.io" + redirectUrl;
+
+            adapter.log.debug("[_handleNewAuthFlow] GET " + absUrl);
+
+            ({ resp, body } = await this._req({
+                method: "GET",
+                url: absUrl,
+                jar,
+                followRedirect: false,
+                gzip: true,
+                headers: {
+                    "User-Agent": ua,
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate"
+                }
+            }));
+
+            const status = resp.statusCode;
+            if (status === 500) {
+                throw new Error("Temporary server error during new auth flow");
+            }
+
+            if (!resp.headers.location) {
+                // Might be a final page, check again if it contains a custom scheme
+                if (absUrl.startsWith("weconnect://")) {
+                    adapter.log.info("[_handleNewAuthFlow] Reached custom scheme without Location");
+                    return absUrl;
+                }
+                throw new Error("No Location header in redirect (new auth flow), status=" + status);
+            }
+
+            redirectUrl = resp.headers.location;
+            adapter.log.debug("[_handleNewAuthFlow] Next redirect: " + redirectUrl);
+
+            // Check again for final callbacks before next iteration
+            if (redirectUrl.startsWith("weconnect://authenticated")) {
+                adapter.log.debug("[_handleNewAuthFlow] Reached OAuth callback URL after redirect");
+                return redirectUrl;
+            }
+            if (redirectUrl.startsWith("weconnect://")) {
+                adapter.log.info("[_handleNewAuthFlow] Found custom scheme URL after redirect: " + redirectUrl);
+                return redirectUrl;
+            }
+
+            maxDepth--;
+        }
+
+        throw new Error("Too many redirects in new auth flow");
+    }
+
+
+
+    async login() {
+        this.config.disableRefresh = false;
+        const jar = request.jar();
+        this._jar = jar;
+        const adapter = this;
+
+        // =============================
+        // STEP 0 — PKCE GENERATION
+        // =============================
+
+        const crypto = require("crypto");
+
+        // Random 64-char verifier
+        const codeVerifier = [...Array(64)]
+            .map(() => Math.random().toString(36)[2])
+            .join("");
+        this.codeVerifier = codeVerifier;
+
+        // Base64URL(SHA256(verifier))
+        const codeChallenge = crypto
+            .createHash("sha256")
+            .update(codeVerifier)
+            .digest("base64")
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_")
+            .replace(/=+$/, "");
+
+        // =============================
+        // STEP 1 — BFF AUTHORIZE
+        // =============================
+
+        const nonce = Math.random().toString(36).slice(2);
+        const authorizeInit =
+            "https://emea.bff.cariad.digital/user-login/v1/authorize" +
+            "?nonce=" + encodeURIComponent(nonce) +
+            "&redirect_uri=" + encodeURIComponent("weconnect://authenticated") +
+            "&code_challenge=" + encodeURIComponent(codeChallenge) +
+            "&code_challenge_method=S256";
+
+        this.log.debug("Step 1: GET authorize -> " + authorizeInit);
+
+        let { resp } = await this._req({
+            method: "GET",
+            url: authorizeInit,
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers: {
+                "User-Agent": this.userAgent
             }
         });
-        // const state = hashArray[0].substring(hashArray[0].indexOf("=") + 1);
-        // const jwtauth_code = hashArray[1].substring(hashArray[1].indexOf("=") + 1);
-        // const jwtaccess_token = hashArray[2].substring(hashArray[2].indexOf("=") + 1);
-        // const jwtid_token = hashArray[5].substring(hashArray[5].indexOf("=") + 1);
-        let method = "POST";
-        let body = "auth_code=" + jwtauth_code + "&id_token=" + jwtid_token;
-        let url = "https://emea.bff.cariad.digital/exchangeAuthCode";
-        let headers = {
-            // "user-agent": this.userAgent,
-            "X-App-version": this.xappversion,
-            "content-type": "application/x-www-form-urlencoded",
-            "x-app-name": this.xappname,
-            accept: "application/json",
-        };
 
-        body += "&brand=" + this.config.type;
+        if (!resp.headers.location) {
+            throw new Error("Missing Location header from BFF authorize");
+        }
 
+        const firstRedirect = resp.headers.location;
+        this.log.debug("Step 2: First redirect -> " + firstRedirect);
 
-        url = "https://emea.bff.cariad.digital/user-login/login/v1";
-        let redirerctUri = "weconnect://authenticated";
+        // =============================
+        // STEP 2 — FULL NEW AUTH FLOW
+        // =============================
 
-        body = JSON.stringify({
-            state: jwtstate,
-            id_token: jwtid_token,
-            redirect_uri: redirerctUri,
+        const callbackUrl = await this._handleNewAuthFlow(firstRedirect, jar);
+
+        if (!callbackUrl || !callbackUrl.startsWith("weconnect://")) {
+            this.log.error("Unexpected callback URL: " + callbackUrl);
+            throw new Error("Unexpected callback URL");
+        }
+
+        this.log.debug("Step 3: Final redirect reached -> extracting tokens");
+
+        // =============================
+        // STEP 3 — TRANSFORM CUSTOM SCHEME
+        // =============================
+
+        function makeHttpFromCustomScheme(cbUrl) {
+            const hashIdx = cbUrl.indexOf("#");
+            const qIdx = cbUrl.indexOf("?");
+
+            let qs = "";
+            if (hashIdx >= 0) qs = cbUrl.substring(hashIdx + 1);
+            else if (qIdx >= 0) qs = cbUrl.substring(qIdx + 1);
+            else return null;
+
+            return "https://egal?" + qs;
+        }
+
+        const httpUrl = makeHttpFromCustomScheme(callbackUrl);
+        if (!httpUrl) {
+            adapter.log.error("Callback URL has no query or fragment: " + callbackUrl);
+            throw new Error("Callback URL has no parameters");
+        }
+
+        this.log.debug("Transformed callback URL -> " + httpUrl);
+
+        let urlObj;
+        try { urlObj = new URL(httpUrl); }
+        catch (e) {
+            this.log.error("Failed to parse transformed callback URL: " + httpUrl);
+            throw e;
+        }
+
+        const params = urlObj.searchParams;
+        const code = params.get("code");
+        const id_token = params.get("id_token");
+        const access_token = params.get("access_token");
+        const state = params.get("state");
+
+        if (!code || !id_token || !access_token || !state) {
+            this.log.error("Missing tokens from callback");
+            this.log.error("Original: " + callbackUrl);
+            this.log.error("Transformed: " + httpUrl);
+            throw new Error("Missing required tokens from callback");
+        }
+
+        // =============================
+        // STEP 4 — BFF TOKEN EXCHANGE
+        // =============================
+
+        this.log.debug("Step 4: Token exchange via Cariad BFF");
+
+        const loginBody = JSON.stringify({
+            state,
+            id_token,
+            redirect_uri: "weconnect://authenticated",
             region: "emea",
-            access_token: jwtaccess_token,
-            authorizationCode: jwtauth_code,
+            access_token,
+            authorizationCode: code,
+            code_verifier: this.codeVerifier
         });
-        // @ts-ignore
-        headers = {
-            accept: "*/*",
+
+        const headers = {
+            "accept": "application/json",
             "content-type": "application/json",
             "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
             "user-agent": this.userAgent,
             "accept-language": "de-de",
-        };
-        if (this.type === "Wc") {
-            reject();
-            return;
-            method = "GET";
-            url = "https://emea.bff.cariad.digital/user-identity/v1/identity/login?redirect_uri=wecharge://authenticated&code=" + jwtauth_code;
-            redirerctUri = "wecharge://authenticated";
-            headers["x-api-key"] = "yabajourasW9N8sm+9F/oP==";
-        }
-
-        request(
-            {
-                method: method,
-                url: url,
-                headers: headers,
-                body: body,
-                jar: this.jar,
-                gzip: true,
-                followAllRedirects: false,
-            },
-            (err, resp, body) => {
-                if (err || (resp && resp.statusCode >= 400)) {
-                    this.log.error("Failed to get token");
-                    err && this.log.error(err);
-                    resp && this.log.error(resp.statusCode.toString());
-                    body && this.log.error(JSON.stringify(body));
-                    reject();
-                    return;
-                }
-                try {
-                    const tokens = JSON.parse(body);
-
-                    this.getVWToken(tokens, jwtid_token, reject, resolve);
-                } catch (err) {
-                    this.log.error(err);
-                    reject();
-                }
-            }
-        );
-    }
-
-    getVWToken(tokens, jwtid_token, reject, resolve) {
-
-        if (this.type === "Wc") {
-            this.config.wc_access_token = tokens.wc_access_token;
-            this.config.wc_refresh_token = tokens.refresh_token;
-            this.log.debug("Wallcharging login successfull");
-            this.getWcData(this.config.historyLimit);
-            resolve();
-            return;
-        }
-        this.config.atoken = tokens.accessToken;
-        this.config.rtoken = tokens.refreshToken;
-
-        //configure for wallcharging login
-
-        this.refreshTokenInterval = setInterval(() => {
-            this.refreshIDToken().catch(() => { });
-        }, 0.9 * 60 * 60 * 1000); // 0.9hours
-
-        //this.config.type === "wc"
-        this.type = "Wc";
-        this.country = "DE";
-        this.clientId = "0fa5ae01-ebc0-4901-a2aa-4dd60572ea0e@apps_vw-dilab_com";
-        this.xclientId = "";
-        this.scope = "openid profile address email";
-        this.redirect = "wecharge://authenticated";
-        this.xrequest = "com.volkswagen.weconnect";
-        this.responseType = "code id_token token";
-        this.xappversion = "";
-        this.xappname = "";
-        this.login().catch(() => {
-            this.log.debug("Failled wall charger login");
-        });
-        resolve();
-        return;
-
-
-        this.config.atoken = tokens.access_token;
-        this.config.rtoken = tokens.refresh_token;
-
-        if (this.refreshTokenInterval) {
-            clearInterval(this.refreshTokenInterval);
-        }
-        this.refreshTokenInterval = setInterval(() => {
-            this.refreshToken().catch(() => {
-                this.log.error("Refresh Token was not successful");
-            });
-        }, 0.9 * 60 * 60 * 1000); // 0.9hours
-
-        resolve();
-        return;
-
-        request.post(
-            {
-                url: "https://mbboauth-1d.prd.ece.vwg-connect.com/mbbcoauth/mobile/oauth2/v1/token",
-                headers: {
-                    "User-Agent": this.userAgent,
-                    "X-App-Version": this.xappversion,
-                    "X-App-Name": this.xappname,
-                    "X-Client-Id": this.xclientId,
-                    Host: "mbboauth-1d.prd.ece.vwg-connect.com",
-                },
-                form: {
-                    grant_type: "id_token",
-                    token: jwtid_token,
-                    scope: "sc2:fal",
-                },
-                jar: this.jar,
-                gzip: true,
-                followAllRedirects: true,
-            },
-            (err, resp, body) => {
-                if (err || (resp && resp.statusCode >= 400)) {
-                    this.log.error("Failed to get VWToken");
-                    err && this.log.error(err);
-                    resp && this.log.error(resp.statusCode.toString());
-                    body && this.log.error(JSON.stringify(body));
-                    resolve();
-                    return;
-                }
-                try {
-                    const tokens = JSON.parse(body);
-                    this.config.vwatoken = tokens.access_token;
-                    this.config.vwrtoken = tokens.refresh_token;
-                    if (this.vwrefreshTokenInterval) {
-                        clearInterval(this.vwrefreshTokenInterval);
-                    }
-                    this.vwrefreshTokenInterval = setInterval(() => {
-                        this.refreshToken(true).catch(() => {
-                            this.log.error("Refresh Token was not successful");
-                        });
-                    }, 0.9 * 60 * 60 * 1000); //0.9hours
-                    resolve();
-                } catch (err) {
-                    this.log.error(err);
-                    reject();
-                }
-            }
-        );
-    }
-
-    refreshToken(isVw) {
-        let url = "https://emea.bff.cariad.digital/refreshTokens";
-        let rtoken = this.config.rtoken;
-        let body = "refresh_token=" + rtoken;
-        let form = "";
-
-        body = "brand=" + this.config.type + "&" + body;
-        let headers = {
-            "user-agent": this.userAgent,
-            "content-type": "application/x-www-form-urlencoded",
-            "X-App-version": this.xappversion,
-            "X-App-name": this.xappname,
-            "X-Client-Id": this.xclientId,
-            accept: "application/json",
+            "cache-control": "no-cache",
+            "pragma": "no-cache",
+            "x-android-package-name": "com.volkswagen.weconnect"
         };
 
-        if (isVw) {
-            url = "https://mbboauth-1d.prd.ece.vwg-connect.com/mbbcoauth/mobile/oauth2/v1/token";
-            rtoken = this.config.vwrtoken;
-            body = "grant_type=refresh_token&scope=sc2%3Afal&token=" + rtoken; //+ "&vin=" + vin;
-        }
-        return new Promise((resolve, reject) => {
-            this.log.debug("refreshToken ");
-            this.log.debug(isVw ? "vw" : "");
-            request.post(
-                {
-                    url: url,
-                    headers: headers,
-                    body: body,
-                    form: form,
-                    gzip: true,
-                    followAllRedirects: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        this.log.error("Failing to refresh token. ");
-                        this.log.error(isVw ? "VwToken" : "");
-                        err && this.log.error(err);
-                        body && this.log.error(body);
-                        resp && this.log.error(resp.statusCode.toString());
-                        setTimeout(() => {
-                            this.log.error("Restart adapter in 10min");
-                            this.restart();
-                        }, 10 * 60 * 1000);
+        const { body: tokenResp } = await this._req({
+            method: "POST",
+            url: "https://emea.bff.cariad.digital/user-login/login/v1",
+            jar,
+            followRedirect: false,
+            gzip: true,
+            headers,
+            body: loginBody
+        });
 
-                        reject();
-                        return;
-                    }
-                    try {
-                        this.log.debug(JSON.stringify(body));
-                        const tokens = JSON.parse(body);
-                        if (tokens.error) {
-                            this.log.error(JSON.stringify(body));
-                            clearTimeout(this.refreshTokenTimeout());
-                            this.refreshTokenTimeout = setTimeout(() => {
-                                this.refreshTokenTimeout = null;
-                                this.refreshToken(isVw).catch(() => {
-                                    this.log.error("refresh token failed");
-                                });
-                            }, 5 * 60 * 1000);
-                            reject();
-                            return;
-                        }
-                        if (isVw) {
-                            this.config.vwatoken = tokens.access_token;
-                            if (tokens.refresh_token) {
-                                this.config.vwrtoken = tokens.refresh_token;
-                            }
-                        } else {
-                            this.config.atoken = tokens.access_token;
-                            if (tokens.refresh_token) {
-                                this.config.rtoken = tokens.refresh_token;
-                            }
-                            if (tokens.accessToken) {
-                                this.config.atoken = tokens.accessToken;
-                                this.config.rtoken = tokens.refreshToken;
-                            }
-                            if (tokens.token) {
-                                this.config.atoken = tokens.token;
-                            }
-                        }
-                        resolve();
-                    } catch (err) {
-                        this.log.error("Failing to parse refresh token. The instance will do restart and try a relogin.");
-                        this.log.error(err);
-                        this.log.error(JSON.stringify(body));
-                        this.log.error(resp.statusCode.toString());
-                        this.log.error(err.stack);
-                        this.restart();
-                    }
-                }
-            );
+        let tokenData;
+        try {
+            tokenData = JSON.parse(tokenResp);
+        } catch (e) {
+            this.log.error("Token JSON parse failed");
+            this.log.error(tokenResp);
+            throw e;
+        }
+
+        const accessToken = tokenData.accessToken || tokenData.access_token;
+        const refreshToken = tokenData.refreshToken || tokenData.refresh_token;
+        const idToken = tokenData.idToken || tokenData.id_token;
+
+        if (!accessToken || !refreshToken || !idToken) {
+            this.log.error("Token response incomplete");
+            this.log.error(tokenResp);
+            throw new Error("Token response incomplete");
+        }
+
+        // =============================
+        // STEP 5 — STORE TOKENS
+        // =============================
+
+        this._accessToken = accessToken;
+        this._refreshToken = refreshToken;
+        this._idToken = idToken;
+
+        this.config.atoken = accessToken;
+        this.config.rtoken = refreshToken;
+        this.config.idtoken = idToken;
+
+        this.log.debug("login successful");
+        return true;
+    }
+
+    /**
+     * Zorgt dat er nooit meer dan één login tegelijk draait.
+     * Andere callers wachten op dezelfde promise.
+     */
+    async _loginOnceGuarded(reason) {
+        if (this.isLoggingIn && this.loginPromise) {
+            this.log.debug("[LoginGuard] Waiting for ongoing login (" + reason + ")");
+            return this.loginPromise;
+        }
+
+        this.isLoggingIn = true;
+        this.loginPromise = (async () => {
+            try {
+                this.log.debug("[LoginGuard] Starting full login (" + reason + ")");
+                await this.login();
+                this.log.debug("(Re-)login completed (" + reason + ")");
+            } catch (e) {
+                this.log.error("[LoginGuard] Login failed (" + reason + "): " + e);
+                throw e;
+            } finally {
+                this.isLoggingIn = false;
+                this.loginPromise = null;
+            }
+        })();
+
+        return this.loginPromise;
+    }
+
+
+
+    updateStatus() {
+        this.vinArray.forEach((vin) => {
+            if (vin === this.currSession.vin) {
+                this.getIdStatus(vin).catch((err) => {
+                    this.log.debug("get id status Failed: " + err);
+                });
+                this.getIdParkingPosition(vin).catch((err) => {
+                    this.log.debug("get id parking position Failed: " + err);
+                });
+            }
         });
     }
+
 
     getPersonalData() {
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
             this.log.debug("START getPersonalData()");
-
             resolve();
-            return;
         });
     }
-
 
     getVehicles() {
         return new Promise((resolve, reject) => {
             this.log.debug("START getVehicles");
-            let url = this.replaceVarInUrl("https://msg.volkswagen.de/fs-car/usermanagement/users/v1/$type/$country/vehicles");
-            let headers = {
-                "User-Agent": this.userAgent,
-                "X-App-Version": this.xappversion,
-                "X-App-Name": this.xappname,
-                Authorization: "Bearer " + this.config.vwatoken,
-                Accept: "application/json",
-            };
 
-            url = "https://emea.bff.cariad.digital/vehicle/v1/vehicles";
-            headers = {
+            const url = "https://emea.bff.cariad.digital/vehicle/v1/vehicles";
+            const headers = {
                 accept: "*/*",
                 "content-type": "application/json",
                 "content-version": "1",
                 "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
                 "user-agent": this.userAgent,
                 "accept-language": "de-de",
-                authorization: "Bearer " + this.config.atoken,
+                authorization: "Bearer " + this.config.atoken
             };
 
             request.get(
                 {
-                    url: url,
-                    headers: headers,
+                    url,
+                    headers,
                     followAllRedirects: true,
                     gzip: true,
-                    json: true,
+                    json: true
                 },
                 (err, resp, body) => {
                     if (err || (resp && resp.statusCode >= 400)) {
                         err && this.log.error(err);
                         resp && this.log.error(resp.statusCode);
-                        reject();
+                        reject(err || new Error("Vehicle request failed"));
+                        return;
                     }
                     try {
                         if (body.errorCode) {
                             this.log.error(JSON.stringify(body));
-                            reject();
+                            reject(new Error("Vehicle response error"));
                             return;
                         }
                         this.log.debug("getVehicles: " + JSON.stringify(body));
                         this.vehicles = body;
                         this.boolFinishVehicles = true;
 
+                        const list = Array.isArray(body.data)
+                            ? body.data
+                            : [];
 
-                        body.data.forEach((element) => {
-                            const vin = element.vin;
-                            if (!vin) {
-                                this.log.info("No vin found for:" + JSON.stringify(element));
-                                return;
-                            }
-                            this.vinArray.push(vin);
-                        });
+                        if (list.length > 0) {
+                            list.forEach((element) => {
+                                const vin = element.vin;
+                                if (!vin) {
+                                    this.log.info(
+                                        "No vin found for:" +
+                                        JSON.stringify(element)
+                                    );
+                                    return;
+                                }
+                                if (!this.vinArray.includes(vin)) {
+                                    this.vinArray.push(vin);
+                                }
+                            });
+                        } else {
+                            this.log.error("No data in server response");
+                        }
                         resolve();
-                        return;
-
-                    } catch (err) {
-                        this.log.error(err);
-                        this.log.error(err.stack);
-                        this.log.error("Not able to find vehicle, did you choose the correct type?");
-                        reject();
-                    }
-                }
-            );
-        });
-        this.log.debug("END getVehicles");
-    }
-
-    getWcData(limit) {
-        if (!limit) {
-            limit = 25;
-        }
-        const header = {
-            accept: "*/*",
-            "content-type": "application/json",
-            "content-version": "1",
-            "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-            "user-agent": this.userAgent,
-            "accept-language": "de-de",
-            authorization: "Bearer " + this.config.atoken,
-            wc_access_token: this.config.wc_access_token,
-        };
-        this.genericRequest("https://emea.bff.cariad.digital/charge-and-pay/v1/user/subscriptions", header, "wecharge.chargeandpay.subscriptions", [404], "result")
-            .then((body) => {
-                body.forEach((subs) => {
-                    this.genericRequest("https://emea.bff.cariad.digital/charge-and-pay/v1/user/tariffs/" + subs.tariff_id, header, "wecharge.chargeandpay.tariffs." + subs.tariff_id, [
-                        404,
-                    ]).catch((hideError) => {
-                        if (hideError) {
-                            this.log.debug("Failed to get tariff");
-                            return;
-                        }
-                        this.log.error("Failed to get tariff");
-                    });
-                });
-            })
-            .catch((hideError) => {
-                if (hideError) {
-                    this.log.debug("Failed to get subscription");
-                    return;
-                }
-                this.log.error("Failed to get subscription");
-            });
-        this.genericRequest("https://emea.bff.cariad.digital/charge-and-pay/v1/charging/records?limit=" + limit + "&offset=0", header, "wecharge.chargeandpay.records", [404], "result")
-            .then((body) => {
-                this.log.debug("wecharge.chargeandpay.records.newestItem: " + JSON.stringify(body));
-                this.chargeAndPay = body;
-                this.boolFinishChargeAndPay = true;
-            })
-            .catch((hideError) => {
-                this.boolFinishChargeAndPay = true;
-                if (hideError) {
-                    this.log.debug("Failed to get chargeandpay records");
-                    return;
-                }
-                this.log.error("Failed to get chargeandpay records");
-
-            });
-        this.genericRequest("https://emea.bff.cariad.digital/home-charging/v1/stations?limit=" + limit, header, "wecharge.homecharging.stations", [404], "result", "stations")
-            .then((body) => {
-                this.stations = body;
-                this.boolFinishStations = true;
-                body.forEach((station) => {
-                    this.log.debug("Station: " + station.name + "/" + station.id);
-                    this.genericRequest(
-                        "https://emea.bff.cariad.digital/home-charging/v1/charging/sessions?station_id=" + station.id + "&limit=" + limit,
-                        header,
-                        "wecharge.homecharging.stations." + station.name + ".sessions",
-                        [404],
-                        "charging_sessions"
-                    )
-                        .then((body) => {
-                            this.log.debug("wecharge.homecharging.stations." + station.name + ".sessions.newesItem: " + JSON.stringify(body[0]));
-                        })
-                        .catch((hideError) => {
-                            if (hideError) {
-                                this.log.debug("Failed to get sessions");
-                                return;
-                            }
-                            this.log.error("Failed to get sessions");
-                        });
-                });
-            })
-            .catch((hideError) => {
-                this.boolFinishStations = true;
-                if (hideError) {
-                    this.log.debug("Failed to get stations");
-                    return;
-                }
-                this.log.error("Failed to get stations");
-            });
-        const dt = new Date();
-        this.genericRequest(
-            "https://emea.bff.cariad.digital/home-charging/v1/charging/records?start_date_time_after=2020-05-01T00:00:00.000Z&start_date_time_before=" + dt.toISOString() + "&limit=" + limit,
-            header,
-            "wecharge.homecharging.records",
-            [404],
-            "charging_records"
-        )
-            .then((body) => {
-                this.log.debug("wecharge.homecharging.records.newesItem: " + JSON.stringify(body));
-                this.homechargingRecords = body;
-                this.boolFinishHomecharging = true;
-            })
-            .catch((hideError) => {
-                this.boolFinishHomecharging = true;
-                if (hideError) {
-                    this.log.debug("Failed to get records");
-                    return;
-                }
-                this.log.error("Failed to get records");
-            });
-        //Pay
-        //Home
-    }
-
-    genericRequest(url, header, path, codesToIgnoreArray, selector1, selector2) {
-        return new Promise(async (resolve, reject) => {
-            header["If-None-Match"] = this.etags[url] || "";
-            request.get(
-                {
-                    url: url,
-                    headers: header,
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        if (resp && resp.statusCode && codesToIgnoreArray.includes(resp.statusCode)) {
-                            err && this.log.debug(err);
-                            resp && this.log.debug(resp.statusCode.toString());
-                            body && this.log.debug(JSON.stringify(body));
-                            reject(true, err);
-                            return;
-                        }
-
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        body && this.log.error(JSON.stringify(body));
-                        reject(false, err);
-                        return;
-                    }
-
-                    this.log.debug("genericRequest <" + url + ">: " + JSON.stringify(body));
-                    this.etags[url] = resp.headers.etag;
-
-                    if (resp.statusCode === 304) {
-                        this.log.debug("304 No values updated");
-                        resolve();
-                        return;
-                    }
-                    try {
-                        if (selector1) {
-                            body = body[selector1];
-                            if (selector2) {
-                                body = body[selector2];
-                            }
-                        }
-                        resolve(body);
-                    } catch (err) {
-                        this.log.error(err);
-                        reject();
+                    } catch (e) {
+                        this.log.error(e);
+                        this.log.error(e.stack);
+                        this.log.error(
+                            "Not able to find vehicle, did you choose the correct type?"
+                        );
+                        reject(e);
                     }
                 }
             );
@@ -1554,19 +1186,32 @@ class VwWeConnect {
 
     async checkSafeFlag(timeout) {
         return new Promise((resolve, reject) => {
-            var counter = 0
-            let checkInterval = setInterval(() => {
-                if (this.idData.access.accessStatus.value.overallStatus == "safe") {
+            let counter = 0;
+            const checkInterval = setInterval(() => {
+                if (
+                    this.idData &&
+                    this.idData.access &&
+                    this.idData.access.accessStatus &&
+                    this.idData.access.accessStatus.value &&
+                    this.idData.access.accessStatus.value.overallStatus ===
+                    "safe"
+                ) {
                     clearInterval(checkInterval);
                     this.config.unSafe = false;
-                    module.exports.idStatusEmitter.emit('statusNotSafe', false);
-                    reject('safe');
+                    module.exports.idStatusEmitter.emit(
+                        "statusNotSafe",
+                        false
+                    );
+                    reject("safe");
                     return;
                 }
                 if (counter++ >= timeout / 2) {
                     clearInterval(checkInterval);
                     this.config.unSafe = true;
-                    module.exports.idStatusEmitter.emit('statusNotSafe', true);
+                    module.exports.idStatusEmitter.emit(
+                        "statusNotSafe",
+                        true
+                    );
                     resolve();
                     return;
                 }
@@ -1575,22 +1220,35 @@ class VwWeConnect {
             this.log.debug(err);
         });
     }
-    
+
     async checkPlugAndPower(timeout) {
         return new Promise((resolve, reject) => {
-            var counter = 0
-            let checkInterval = setInterval(() => {
-                if (this.idData.charging.plugStatus.value.externalPower == "ready" || this.idData.charging.plugStatus.value.externalPower == "active") {
+            let counter = 0;
+            const checkInterval = setInterval(() => {
+                const charging = this.idData && this.idData.charging;
+                const plugStatus =
+                    charging && charging.plugStatus && charging.plugStatus.value;
+                if (
+                    plugStatus &&
+                    (plugStatus.externalPower === "ready" ||
+                        plugStatus.externalPower === "active")
+                ) {
                     clearInterval(checkInterval);
                     this.config.noExternalPower = false;
-                    module.exports.idStatusEmitter.emit('noExternalPower', false);
-                    reject('powerReady');
+                    module.exports.idStatusEmitter.emit(
+                        "noExternalPower",
+                        false
+                    );
+                    reject("powerReady");
                     return;
                 }
                 if (counter++ >= timeout / 2) {
                     clearInterval(checkInterval);
                     this.config.noExternalPower = true;
-                    module.exports.idStatusEmitter.emit('noExternalPower', true);
+                    module.exports.idStatusEmitter.emit(
+                        "noExternalPower",
+                        true
+                    );
                     resolve();
                     return;
                 }
@@ -1600,78 +1258,340 @@ class VwWeConnect {
         });
     }
 
-    runEventEmitters() {
-        module.exports.idStatusEmitter.emit('eventRunStarted');
-        if (typeof (this.idDataOld) == "undefined") {
+    async logToDb() {
+        if (!this.currSession || !this.currSession.vin) {
+            throw new Error("VIN missing");
+        }
+        if (!this.config.db) {
+            return null;
+        }
+
+        try {
+            const odoRaw =
+                this.idData?.measurements?.odometerStatus?.value?.odometer;
+            const socRaw =
+                this.idData?.charging?.batteryStatus?.value?.currentSOC_pct;
+            const rngRaw =
+                this.idData?.charging?.batteryStatus?.value
+                    ?.cruisingRangeElectric_km;
+            const latRaw = this.idParkingPosition?.data?.lat;
+            const lonRaw = this.idParkingPosition?.data?.lon;
+
+            const toNum = (v) => {
+                const n = Number(v);
+                return Number.isFinite(n) ? n : null;
+            };
+
+            const sql =
+                "INSERT INTO travel (vin, odo, soc, rng, lat, lon) VALUES (?, ?, ?, ?, ?, ?)";
+
+            const params = [
+                this.currSession.vin || null,
+                toNum(odoRaw),
+                toNum(socRaw),
+                toNum(rngRaw),
+                toNum(latRaw),
+                toNum(lonRaw)
+            ];
+
+            const [result] = await this.config.db
+                .promise()
+                .execute(sql, params);
+            return (result && result.insertId) || null;
+        } catch (err) {
+            console.error("DB error:", err);
+            return null;
+        }
+    }
+
+    async runEventEmitters() {
+        module.exports.idStatusEmitter.emit("eventRunStarted");
+        if (typeof this.idDataOld === "undefined") {
             return;
         }
 
         try {
             // parking
-            if (this.idData.parking.data.carIsParked != this.idDataOld.parking.data.carIsParked) { 
-                if (this.idData.parking.data.carIsParked) {
-                    module.exports.idStatusEmitter.emit('positionUpdate', this.idData.parking.data);
-                } else {
-                    module.exports.idStatusEmitter.emit('positionUnknown');
+            if (
+                this.idData.parking.data.carIsParked !==
+                this.idDataOld.parking.data.carIsParked
+            ) {
+                if (this.config.db) {
+                    await this.logToDb();
                 }
-                module.exports.idStatusEmitter.emit('parked', this.idData.parking.data.carIsParked);
-                module.exports.idStatusEmitter.emit('notParked', !this.idData.parking.data.carIsParked);
+                if (this.idData.parking.data.carIsParked) {
+                    module.exports.idStatusEmitter.emit(
+                        "positionUpdate",
+                        this.idData.parking.data
+                    );
+                } else {
+                    module.exports.idStatusEmitter.emit("positionUnknown");
+                }
+                module.exports.idStatusEmitter.emit(
+                    "parked",
+                    this.idData.parking.data.carIsParked
+                );
+                module.exports.idStatusEmitter.emit(
+                    "notParked",
+                    !this.idData.parking.data.carIsParked
+                );
             }
-            if (this.idData.parking.data.carIsParked && (this.idData.access.accessStatus.value.overallStatus != "safe") && (!this.idDataOld.parking.data.carIsParked || (this.idDataOld.access.accessStatus.value.overallStatus == "safe"))) {
+            if (
+                this.idData.parking.data.carIsParked &&
+                this.idData.access.accessStatus.value.overallStatus !==
+                "safe" &&
+                (!this.idDataOld.parking.data.carIsParked ||
+                    this.idDataOld.access.accessStatus.value
+                        .overallStatus === "safe")
+            ) {
                 this.checkSafeFlag(this.config.checkSafeStatusTimeout);
-            } 
-            
-            if ( (this.idData.access.accessStatus.value.overallStatus == "safe") && (this.idDataOld.access.accessStatus.value.overallStatus != "safe") ) { 
-                module.exports.idStatusEmitter.emit('statusNotSafe', false); 
+            }
+
+            if (
+                this.idData.access.accessStatus.value.overallStatus ===
+                "safe" &&
+                this.idDataOld.access.accessStatus.value.overallStatus !==
+                "safe"
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "statusNotSafe",
+                    false
+                );
                 this.config.unSafe = false;
             }
-            
-            if ( (this.idData.access.accessStatus.value.doorLockStatus != "locked") && (this.idDataOld.access.accessStatus.value.doorLockStatus == "locked") ) { module.exports.idStatusEmitter.emit('carLocked', false); }
-            if ( (this.idData.access.accessStatus.value.doorLockStatus == "locked") && (this.idDataOld.access.accessStatus.value.doorLockStatus != "locked") ) { module.exports.idStatusEmitter.emit('carLocked', true); }
-            
-           
+
+            if (
+                this.idData.access.accessStatus.value.doorLockStatus !==
+                "locked" &&
+                this.idDataOld.access.accessStatus.value.doorLockStatus ===
+                "locked"
+            ) {
+                module.exports.idStatusEmitter.emit("carLocked", false);
+            }
+            if (
+                this.idData.access.accessStatus.value.doorLockStatus ===
+                "locked" &&
+                this.idDataOld.access.accessStatus.value.doorLockStatus !==
+                "locked"
+            ) {
+                module.exports.idStatusEmitter.emit("carLocked", true);
+            }
+
             // charging
-            if ((this.idData.charging.chargingStatus.value.chargingState.includes("chargePurposeReached") || (this.idData.charging.chargingStatus.value.chargingState != "charging" && this.idData.charging.chargingSettings.value.targetSOC_pct == this.idData.charging.batteryStatus.value.currentSOC_pct)) && this.idDataOld.charging.chargingStatus.value.chargingState == "charging") { module.exports.idStatusEmitter.emit('chargePurposeReached'); }
-            if (this.idData.charging.chargingStatus.value.chargingState == "charging" && this.idDataOld.charging.chargingStatus.value.chargingState != "charging") { module.exports.idStatusEmitter.emit('chargingStarted'); }
-            if (this.idData.charging.chargingStatus.value.chargingState != "charging" && this.idDataOld.charging.chargingStatus.value.chargingState == "charging") { module.exports.idStatusEmitter.emit('chargingStopped'); }
-            if (this.idData.charging.batteryStatus.value.currentSOC_pct != this.idDataOld.charging.batteryStatus.value.currentSOC_pct) { module.exports.idStatusEmitter.emit('currentSOC', this.idData.charging.batteryStatus.value.currentSOC_pct); }
-            if (this.idData.charging.batteryStatus.value.cruisingRangeElectric_km != this.idDataOld.charging.batteryStatus.value.cruisingRangeElectric_km) { module.exports.idStatusEmitter.emit('remainingRange', this.idData.charging.batteryStatus.value.cruisingRangeElectric_km); }
-            if (this.idData.charging.plugStatus.value.plugConnectionState == "connected" && this.idDataOld.charging.plugStatus.value.plugConnectionState == "disconnected") {
+            if (
+                (this.idData.charging.chargingStatus.value.chargingState.includes(
+                    "chargePurposeReached"
+                ) ||
+                    (this.idData.charging.chargingStatus.value
+                        .chargingState !== "charging" &&
+                        this.idData.charging.chargingSettings.value
+                            .targetSOC_pct ===
+                        this.idData.charging.batteryStatus.value
+                            .currentSOC_pct)) &&
+                this.idDataOld.charging.chargingStatus.value
+                    .chargingState === "charging"
+            ) {
+                module.exports.idStatusEmitter.emit("chargePurposeReached");
+            }
+            if (
+                this.idData.charging.chargingStatus.value
+                    .chargingState === "charging" &&
+                this.idDataOld.charging.chargingStatus.value
+                    .chargingState !== "charging"
+            ) {
+                module.exports.idStatusEmitter.emit("chargingStarted");
+            }
+            if (
+                this.idData.charging.chargingStatus.value
+                    .chargingState !== "charging" &&
+                this.idDataOld.charging.chargingStatus.value
+                    .chargingState === "charging"
+            ) {
+                module.exports.idStatusEmitter.emit("chargingStopped");
+            }
+            if (
+                this.idData.charging.batteryStatus.value.currentSOC_pct !==
+                this.idDataOld.charging.batteryStatus.value.currentSOC_pct
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "currentSOC",
+                    this.idData.charging.batteryStatus.value
+                        .currentSOC_pct
+                );
+            }
+            if (
+                this.idData.charging.batteryStatus.value
+                    .cruisingRangeElectric_km !==
+                this.idDataOld.charging.batteryStatus.value
+                    .cruisingRangeElectric_km
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "remainingRange",
+                    this.idData.charging.batteryStatus.value
+                        .cruisingRangeElectric_km
+                );
+            }
+            if (
+                this.idData.charging.plugStatus.value
+                    .plugConnectionState === "connected" &&
+                this.idDataOld.charging.plugStatus.value
+                    .plugConnectionState === "disconnected"
+            ) {
                 this.checkPlugAndPower(this.config.checkSafeStatusTimeout);
-            } 
-             
-            if ( (this.idData.charging.plugStatus.value.plugConnectionState == "disconnected" && this.idDataOld.charging.plugStatus.value.plugConnectionState == "connected") ||
-                 ((this.idData.charging.plugStatus.value.externalPower == "ready" || this.idData.charging.plugStatus.value.externalPower == "active") && this.config.noExternalPower) ) { 
-                module.exports.idStatusEmitter.emit('noExternalPower', false); 
+            }
+
+            if (
+                (this.idData.charging.plugStatus.value
+                    .plugConnectionState === "disconnected" &&
+                    this.idDataOld.charging.plugStatus.value
+                        .plugConnectionState === "connected") ||
+                ((this.idData.charging.plugStatus.value.externalPower ===
+                    "ready" ||
+                    this.idData.charging.plugStatus.value
+                        .externalPower === "active") &&
+                    this.config.noExternalPower)
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "noExternalPower",
+                    false
+                );
                 this.config.noExternalPower = false;
             }
-            
-            if (this.idData.charging.chargingSettings.value.targetSOC_pct != this.idDataOld.charging.chargingSettings.value.targetSOC_pct) { module.exports.idStatusEmitter.emit('targetSOCupdated'); }
-            if (this.idData.charging.chargingSettings.value.maxChargeCurrentAC != this.idDataOld.charging.chargingSettings.value.maxChargeCurrentAC) { module.exports.idStatusEmitter.emit('reducedACupdated'); }
-            if (this.idData.charging.chargingSettings.value.autoUnlockPlugWhenCharged != this.idDataOld.charging.chargingSettings.value.autoUnlockPlugWhenCharged) { module.exports.idStatusEmitter.emit('autoUnlockPlugUpdated'); }
-            
-            // climatisation
-            if (this.idData.climatisation.climatisationStatus.value.climatisationState == "off" && this.idDataOld.climatisation.climatisationStatus.value.climatisationState != "off") { module.exports.idStatusEmitter.emit('climatisationStopped'); }
-            if (this.idData.climatisation.climatisationStatus.value.climatisationState != "off" && this.idDataOld.climatisation.climatisationStatus.value.climatisationState == "off") { module.exports.idStatusEmitter.emit('climatisationStarted'); }
-            if (this.idData.climatisation.climatisationStatus.value.climatisationState == "cooling" && this.idDataOld.climatisation.climatisationStatus.value.climatisationState != "cooling") { module.exports.idStatusEmitter.emit('climatisationCoolingStarted'); }
-            if (this.idData.climatisation.climatisationStatus.value.climatisationState == "heating" && this.idDataOld.climatisation.climatisationStatus.value.climatisationState != "heating") { module.exports.idStatusEmitter.emit('climatisationHeatingStarted'); }
-            if (this.idData.climatisation.climatisationSettings.value.targetTemperature_C != this.idDataOld.climatisation.climatisationSettings.value.targetTemperature_C) { module.exports.idStatusEmitter.emit('climatisationTemperatureUpdated'); }
-            if (this.idData.climatisation.climatisationSettings.value.climatizationAtUnlock != this.idDataOld.climatisation.climatisationSettings.value.climatizationAtUnlock) { module.exports.idStatusEmitter.emit('climatisationAtUnlockUpdated'); }
-            if (this.idData.climatisation.climatisationSettings.value.windowHeatingEnabled != this.idDataOld.climatisation.climatisationSettings.value.windowHeatingEnabled) { module.exports.idStatusEmitter.emit('windowHeatingUpdated'); }
-            if (this.idData.climatisation.climatisationSettings.value.zoneFrontLeftEnabled != this.idDataOld.climatisation.climatisationSettings.value.zoneFrontLeftEnabled) { module.exports.idStatusEmitter.emit('zoneFrontLeftUpdated'); }
-            if (this.idData.climatisation.climatisationSettings.value.zoneFrontRightEnabled != this.idDataOld.climatisation.climatisationSettings.value.zoneFrontRightEnabled) { module.exports.idStatusEmitter.emit('zoneFrontRightUpdated'); }
 
-            if (this.config.backendError) {
-                this.log.info("Current car state back in sync with VW backend.");
-                module.exports.idStatusEmitter.emit('backendError', false);
-                this.config.backendError = false;
+            if (
+                this.idData.charging.chargingSettings.value
+                    .targetSOC_pct !==
+                this.idDataOld.charging.chargingSettings.value
+                    .targetSOC_pct
+            ) {
+                module.exports.idStatusEmitter.emit("targetSOCupdated");
+            }
+            if (
+                this.idData.charging.chargingSettings.value
+                    .maxChargeCurrentAC !==
+                this.idDataOld.charging.chargingSettings.value
+                    .maxChargeCurrentAC
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "reducedACupdated"
+                );
+            }
+            if (
+                this.idData.charging.chargingSettings.value
+                    .autoUnlockPlugWhenCharged !==
+                this.idDataOld.charging.chargingSettings.value
+                    .autoUnlockPlugWhenCharged
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "autoUnlockPlugUpdated"
+                );
             }
 
+            // climatisation
+            if (
+                this.idData.climatisation.climatisationStatus.value
+                    .climatisationState === "off" &&
+                this.idDataOld.climatisation.climatisationStatus.value
+                    .climatisationState !== "off"
+            ) {
+                module.exports.idStatusEmitter.emit("climatisationStopped");
+            }
+            if (
+                this.idData.climatisation.climatisationStatus.value
+                    .climatisationState !== "off" &&
+                this.idDataOld.climatisation.climatisationStatus.value
+                    .climatisationState === "off"
+            ) {
+                module.exports.idStatusEmitter.emit("climatisationStarted");
+            }
+            if (
+                this.idData.climatisation.climatisationStatus.value
+                    .climatisationState === "cooling" &&
+                this.idDataOld.climatisation.climatisationStatus.value
+                    .climatisationState !== "cooling"
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "climatisationCoolingStarted"
+                );
+            }
+            if (
+                this.idData.climatisation.climatisationStatus.value
+                    .climatisationState === "heating" &&
+                this.idDataOld.climatisation.climatisationStatus.value
+                    .climatisationState !== "heating"
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "climatisationHeatingStarted"
+                );
+            }
+            if (
+                this.idData.climatisation.climatisationSettings.value
+                    .targetTemperature_C !==
+                this.idDataOld.climatisation.climatisationSettings.value
+                    .targetTemperature_C
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "climatisationTemperatureUpdated"
+                );
+            }
+            if (
+                this.idData.climatisation.climatisationSettings.value
+                    .climatizationAtUnlock !==
+                this.idDataOld.climatisation.climatisationSettings.value
+                    .climatizationAtUnlock
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "climatisationAtUnlockUpdated"
+                );
+            }
+            if (
+                this.idData.climatisation.climatisationSettings.value
+                    .windowHeatingEnabled !==
+                this.idDataOld.climatisation.climatisationSettings.value
+                    .windowHeatingEnabled
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "windowHeatingUpdated"
+                );
+            }
+            if (
+                this.idData.climatisation.climatisationSettings.value
+                    .zoneFrontLeftEnabled !==
+                this.idDataOld.climatisation.climatisationSettings.value
+                    .zoneFrontLeftEnabled
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "zoneFrontLeftUpdated"
+                );
+            }
+            if (
+                this.idData.climatisation.climatisationSettings.value
+                    .zoneFrontRightEnabled !==
+                this.idDataOld.climatisation.climatisationSettings.value
+                    .zoneFrontRightEnabled
+            ) {
+                module.exports.idStatusEmitter.emit(
+                    "zoneFrontRightUpdated"
+                );
+            }
+
+            if (this.config.backendError) {
+                this.log.info(
+                    "Current car state back in sync with VW backend."
+                );
+                module.exports.idStatusEmitter.emit(
+                    "backendError",
+                    false
+                );
+                this.config.backendError = false;
+            }
         } catch (err) {
             if (!this.config.backendError) {
-                this.log.error("Current car state not (correctly) received from VW backend.");
+                this.log.error(
+                    "Current car state not (correctly) received from VW backend."
+                );
                 this.log.debug(err);
-                module.exports.idStatusEmitter.emit('backendError', true);
+                module.exports.idStatusEmitter.emit("backendError", true);
                 this.config.backendError = true;
             }
         }
@@ -1679,275 +1599,341 @@ class VwWeConnect {
 
     populateConfig() {
         this.log.debug("START populateConfig");
-     
-        this.config.targetTempC = this.idData.climatisation.climatisationSettings.value.targetTemperature_C;
-        this.config.targetSOC = this.idData.charging.chargingSettings.value.targetSOC_pct;
-        this.config.chargeCurrent = this.idData.charging.chargingSettings.value.maxChargeCurrentAC;
-        this.config.autoUnlockPlug = this.idData.charging.chargingSettings.value.autoUnlockPlugWhenCharged === 'permanent';
-        this.config.climatizationAtUnlock = this.idData.climatisation.climatisationSettings.value.climatizationAtUnlock;
-        this.config.climatisationWindowHeating = this.idData.climatisation.climatisationSettings.value.windowHeatingEnabled;
-        this.config.climatisationFrontLeft = this.idData.climatisation.climatisationSettings.value.zoneFrontLeftEnabled;
-        this.config.climatisationFrontRight = this.idData.climatisation.climatisationSettings.value.zoneFrontRightEnabled;
-        
+
+        try {
+            this.config.targetTempC =
+                this.idData.climatisation.climatisationSettings.value
+                    .targetTemperature_C;
+            this.config.targetSOC =
+                this.idData.charging.chargingSettings.value.targetSOC_pct;
+            this.config.chargeCurrent =
+                this.idData.charging.chargingSettings.value.maxChargeCurrentAC;
+            this.config.autoUnlockPlug =
+                this.idData.charging.chargingSettings.value
+                    .autoUnlockPlugWhenCharged === "permanent";
+            this.config.climatizationAtUnlock =
+                this.idData.climatisation.climatisationSettings.value
+                    .climatizationAtUnlock;
+            this.config.climatisationWindowHeating =
+                this.idData.climatisation.climatisationSettings.value
+                    .windowHeatingEnabled;
+            this.config.climatisationFrontLeft =
+                this.idData.climatisation.climatisationSettings.value
+                    .zoneFrontLeftEnabled;
+            this.config.climatisationFrontRight =
+                this.idData.climatisation.climatisationSettings.value
+                    .zoneFrontRightEnabled;
+        } catch (e) {
+            this.log.error("populateConfig failed");
+            this.log.error(e);
+        }
+
         this.log.debug("END populateConfig");
-
     }
 
-    getIdStatus(vin) {
-        return new Promise((resolve, reject) => {
-            this.log.debug("START getIdStatus");
-            request.get(
-                {
-                    url: "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" + vin + "/selectivestatus?jobs=access,activeVentilation,auxiliaryHeating,batteryChargingCare,batterySupport,charging,chargingProfiles,climatisation,climatisationTimers,departureProfiles,fuelStatus,honkAndFlash,hybridCarAuxiliaryHeating,userCapabilities,vehicleHealthWarnings,vehicleHealthInspection,vehicleLights,measurements,departureTimers",
+    async getIdStatus(vin) {
+        this.log.debug("[IDStatus] START getIdStatus for VIN " + vin);
 
-                    headers: {
-                        accept: "*/*",
-                        "content-type": "application/json",
-                        "content-version": "1",
-                        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-                        "user-agent": this.userAgent,
-                        "accept-language": "de-de",
-                        authorization: "Bearer " + this.config.atoken,
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode);
+        const url =
+            "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" +
+            vin +
+            "/selectivestatus?jobs=access,activeVentilation,auxiliaryHeating,batteryChargingCare,batterySupport,charging,chargingProfiles,climatisation,climatisationTimers,departureProfiles,fuelStatus,honkAndFlash,hybridCarAuxiliaryHeating,userCapabilities,vehicleHealthWarnings,vehicleHealthInspection,vehicleLights,measurements,departureTimers";
 
-                        reject();
-                        return;
-                    }
-                    this.log.debug("getIdStatus: " + JSON.stringify(body));
+        const headers = {
+            accept: "*/*",
+            "content-type": "application/json",
+            "content-version": "1",
+            "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
+            "user-agent": this.userAgent,
+            "accept-language": "de-de",
+            authorization: "Bearer " + this.config.atoken
+        };
 
-                    if (typeof (this.idData) != "undefined") {
-                        this.idDataOld = this.idData;
-                    }
+        const callOnce = async () => {
+            return this._req({
+                method: "GET",
+                url,
+                headers,
+                followAllRedirects: true,
+                gzip: true,
+                json: true
+            });
+        };
 
-                    this.idData = body;
+        try {
+            // eerste poging
+            let { resp, body } = await callOnce();
 
-                    if (typeof (this.idData) != "undefined") {
-                        if (this.pendingRequests == 0) {
-                            this.populateConfig();
-                        }
-                    }
-                   
-                    if (typeof (this.idParkingPosition) != "undefined") {
-                        this.idData.parking = {};
-                        Object.assign(this.idData.parking, this.idParkingPosition);
-                    }
+            if (resp.statusCode === 401) {
+                this.log.debug("[IDStatus] 401 → performing full login()");
+                await this._loginOnceGuarded("getIdStatus 401");
 
-                    this.runEventEmitters();
+                // tweede poging na login
+                ({ resp, body } = await callOnce());
 
-                    this.boolFinishIdData = true;
-
-                    try {
-                        const adapter = this;
-                        traverse(body.data).forEach(function (value) {
-                            if (this.path.length > 0 && this.isLeaf) {
-                                const modPath = this.path;
-                                this.path.forEach((pathElement, pathIndex) => {
-                                    if (!isNaN(parseInt(pathElement))) {
-                                        let stringPathIndex = parseInt(pathElement) + 1 + "";
-                                        while (stringPathIndex.length < 2) stringPathIndex = "0" + stringPathIndex;
-                                        const key = this.path[pathIndex - 1] + stringPathIndex;
-                                        const parentIndex = modPath.indexOf(pathElement) - 1;
-                                        modPath[parentIndex] = key;
-                                        modPath.splice(parentIndex + 1, 1);
-                                    }
-                                });
-                                if (modPath[modPath.length - 1] !== "$") {
-                                    if (typeof value === "object") {
-                                        value = JSON.stringify(value);
-                                    }
-                                }
-                            }
-                        });
-
-                        resolve();
-                    } catch (err) {
-                        this.log.error(err);
-                        reject();
-                    }
+                if (resp.statusCode === 401) {
+                    this.log.debug("[IDStatus] 401 again after relogin → giving up");
+                    throw new Error("auth-failed");
                 }
-            );
-            this.log.debug("END getIdStatus");
-        });
+            }
+
+            if (resp.statusCode >= 400) {
+                this.log.debug("[IDStatus] HTTP " + resp.statusCode);
+                this.log.debug("[IDStatus] Body: " + JSON.stringify(body));
+                throw new Error("getIdStatus HTTP " + resp.statusCode);
+            }
+
+            if (typeof body !== "object" || body === null) {
+                this.log.debug("[IDStatus] Invalid JSON body");
+                throw new Error("invalid-json");
+            }
+
+            if (this.idData) {
+                this.idDataOld = this.idData;
+            }
+
+            this.idData = body;
+
+            // parking info erbij plakken indien bekend
+            if (this.idParkingPosition) {
+                this.idData.parking = { ...this.idParkingPosition };
+            }
+
+            await this.runEventEmitters();
+            this.boolFinishIdData = true;
+
+            this.log.debug("[IDStatus] Success for VIN " + vin);
+        } catch (err) {
+            this.log.debug("[IDStatus] Error: " + err);
+            throw err;
+        }
     }
 
-    getIdParkingPosition(vin) {
-        return new Promise((resolve, reject) => {
-            this.log.debug("START getIdParkingPosition");
-            request.get(
-                {
-                    url: "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" + vin + "/parkingposition",
 
-                    headers: {
-                        accept: "*/*",
-                        "content-type": "application/json",
-                        "content-version": "1",
-                        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-                        "user-agent": this.userAgent,
-                        "accept-language": "de-de",
-                        authorization: "Bearer " + this.config.atoken,
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode);
 
-                        reject();
-                        return;
-                    }
-                    this.log.debug("getIdParkingPosition: " + JSON.stringify(body));
-                    if (typeof (body) != "undefined") {
-                        this.idParkingPosition = body;
-                        this.idParkingPosition.data.carIsParked = true;
-                    } else {
-                        this.idParkingPosition = { "data": { "carIsParked": false } };
-                    }
 
-                    try {
-                        const adapter = this;
-                        traverse(this.idParkingPosition).forEach(function (value) {
-                            if (this.path.length > 0 && this.isLeaf) {
-                                const modPath = this.path;
-                                this.path.forEach((pathElement, pathIndex) => {
-                                    if (!isNaN(parseInt(pathElement))) {
-                                        let stringPathIndex = parseInt(pathElement) + 1 + "";
-                                        while (stringPathIndex.length < 2) stringPathIndex = "0" + stringPathIndex;
-                                        const key = this.path[pathIndex - 1] + stringPathIndex;
-                                        const parentIndex = modPath.indexOf(pathElement) - 1;
-                                        modPath[parentIndex] = key;
-                                        modPath.splice(parentIndex + 1, 1);
-                                    }
-                                });
-                                if (modPath[modPath.length - 1] !== "$") {
-                                    if (typeof value === "object") {
-                                        value = JSON.stringify(value);
-                                    }
-                                }
-                            }
-                        });
+    async getIdParkingPosition(vin) {
+        if (!this.hasParkingPosition(vin)) {
+            this.log.debug("[Parking] VIN " + vin + " has no parkingPosition capability");
+            return;
+        }
 
-                        resolve();
-                    } catch (err) {
-                        this.log.error(err);
-                        reject();
-                    }
+        const url =
+            "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" +
+            vin +
+            "/parkingposition";
+
+        const headers = {
+            accept: "*/*",
+            "content-type": "application/json",
+            "content-version": "1",
+            "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
+            "user-agent": this.userAgent,
+            "accept-language": "de-de",
+            authorization: "Bearer " + this.config.atoken
+        };
+
+        const callOnce = async () => {
+            return this._req({
+                method: "GET",
+                url,
+                headers,
+                followAllRedirects: true,
+                gzip: true,
+                json: true
+            });
+        };
+
+        try {
+            this.log.debug("[Parking] GET " + url);
+
+            // eerste poging
+            let { resp, body } = await callOnce();
+
+            if (resp.statusCode === 401) {
+                this.log.debug("[Parking] 401 → performing full login()");
+                await this._loginOnceGuarded("getIdParkingPosition 401");
+
+                // tweede poging na login
+                ({ resp, body } = await callOnce());
+
+                if (resp.statusCode === 401) {
+                    this.log.debug("[Parking] 401 again after relogin → giving up");
+                    throw new Error("auth-failed");
                 }
-            );
-            this.log.debug("END getIdParkingPosition");
-        });
+            }
+
+            if (resp.statusCode >= 400) {
+                this.log.debug("[Parking] HTTP " + resp.statusCode);
+                this.log.debug("[Parking] Body: " + JSON.stringify(body));
+                throw new Error("getIdParkingPosition HTTP " + resp.statusCode);
+            }
+
+            if (!body) {
+                this.log.debug("[Parking] Empty body");
+                this.idParkingPosition = { data: { carIsParked: false } };
+                return;
+            }
+
+            this.idParkingPosition = body;
+            if (!this.idParkingPosition.data) {
+                this.idParkingPosition.data = {};
+            }
+            this.idParkingPosition.data.carIsParked = true;
+
+            this.log.debug("[Parking] Success for VIN " + vin);
+        } catch (err) {
+            this.log.debug("[Parking] Error: " + err);
+            throw err;
+        }
     }
 
-    setIdRemote(vin, action, value, bodyContent) {
-        return new Promise(async (resolve, reject) => {
-            this.log.debug("setIdRemote >>");
+
+
+
+    setIdRemote(vin, action, value, bodyContent, isRetry = false) {
+        return new Promise((resolve, reject) => {
+            this.log.debug("setIdRemote >> " + action + "/" + value + " (retry=" + isRetry + ")");
+
             let body = bodyContent || {};
+
             if (action === "climatisation" && value === "settings") {
-                const climateStates = this.idData.climatisation.climatisationSettings.value; // get this from the internal object filled by getData()
+                const climateStates =
+                    this.idData.climatisation.climatisationSettings.value;
                 body = {};
                 const allIds = Object.keys(climateStates);
                 allIds.forEach((keyName) => {
                     let key = keyName.split(".").splice(-1)[0];
 
-                    if (key == "targetTemperature_C") {
+                    if (key === "targetTemperature_C") {
                         key = "targetTemperature";
-                        if (this.config.targetTempC >= 16 && this.config.targetTempC <= 27) {
+                        if (
+                            this.config.targetTempC >= 16 &&
+                            this.config.targetTempC <= 27
+                        ) {
                             climateStates[keyName] = this.config.targetTempC;
-                        } else if (this.config.targetTempC != -1) {
-                            this.log.error("Cannot set temperature to " + this.config.targetTempC + "°C.");
-                            reject();
+                        } else if (this.config.targetTempC !== -1) {
+                            this.log.error(
+                                "Cannot set temperature to " +
+                                this.config.targetTempC +
+                                "°C."
+                            );
+                            reject(
+                                new Error(
+                                    "Invalid temperature " +
+                                    this.config.targetTempC
+                                )
+                            );
                             return;
                         }
                     }
 
-                    if (key == "targetTemperature_K" || key == "targetTemperature_F") {
+                    if (
+                        key === "targetTemperature_K" ||
+                        key === "targetTemperature_F"
+                    ) {
                         return;
-                        //climateStates[keyName] = this.config.targetTempC + 273.15;
                     }
 
-                    if (key == "unitInCar") {
+                    if (key === "unitInCar") {
                         key = "targetTemperatureUnit";
                     }
 
-                    if (key == "climatizationAtUnlock") {
-                        climateStates[keyName] = this.config.climatizationAtUnlock;
+                    if (key === "climatizationAtUnlock") {
+                        climateStates[keyName] =
+                            this.config.climatizationAtUnlock;
                     }
-                    if (key == "windowHeatingEnabled") {
-                        climateStates[keyName] = this.config.climatisationWindowHeating;
+                    if (key === "windowHeatingEnabled") {
+                        climateStates[keyName] =
+                            this.config.climatisationWindowHeating;
                     }
-                    if (key == "zoneFrontLeftEnabled") {
-                        climateStates[keyName] = this.config.climatisationFrontLeft;
+                    if (key === "zoneFrontLeftEnabled") {
+                        climateStates[keyName] =
+                            this.config.climatisationFrontLeft;
                     }
-                    if (key == "zoneFrontRightEnabled") {
-                        climateStates[keyName] = this.config.climatisationFrontRight;
+                    if (key === "zoneFrontRightEnabled") {
+                        climateStates[keyName] =
+                            this.config.climatisationFrontRight;
                     }
 
-                    if (key.indexOf("Timestamp") === -1) {
+                    if (!key.includes("Timestamp")) {
                         body[key] = climateStates[keyName];
                     }
                 });
                 body["climatisationWithoutExternalPower"] = true;
 
-                // body = JSON.stringify(body);
-                this.config.pendingRequests = Math.max(this.config.pendingRequests - 1, 0);
+                this.config.pendingRequests = Math.max(
+                    this.config.pendingRequests - 1,
+                    0
+                );
             }
+
             if (action === "charging" && value === "settings") {
-                const chargingStates = this.idData.charging.chargingSettings.value; // get this from the internal object filled by getData()
+                const chargingStates =
+                    this.idData.charging.chargingSettings.value;
                 body = {};
                 const allIds = Object.keys(chargingStates);
                 allIds.forEach((keyName) => {
                     const key = keyName.split(".").splice(-1)[0];
-                    if (this.config.targetSOC >= 50 && this.config.targetSOC <= 100) {
-                        if (key == "targetSOC_pct") {
+                    if (
+                        this.config.targetSOC >= 50 &&
+                        this.config.targetSOC <= 100
+                    ) {
+                        if (key === "targetSOC_pct") {
                             chargingStates[keyName] = this.config.targetSOC;
                         }
                     }
-                    if (this.config.chargeCurrent == "maximum" || this.config.chargeCurrent == "reduced") {
-                        if (key == "maxChargeCurrentAC") {
-                            chargingStates[keyName] = this.config.chargeCurrent;
+                    if (
+                        this.config.chargeCurrent === "maximum" ||
+                        this.config.chargeCurrent === "reduced"
+                    ) {
+                        if (key === "maxChargeCurrentAC") {
+                            chargingStates[keyName] =
+                                this.config.chargeCurrent;
                         }
                     }
-                    if (key == "autoUnlockPlugWhenCharged") {
-                        chargingStates[keyName] = this.config.autoUnlockPlug ? "permanent" : "off";
+                    if (key === "autoUnlockPlugWhenCharged") {
+                        chargingStates[keyName] = this.config.autoUnlockPlug
+                            ? "permanent"
+                            : "off";
                     }
-                    else {
-                        //this.log.error("Cannot set target SOC to " + this.config.targetSOC + "%, and charge current to "+ this.config.chargeCurrent + ".");
-                        //reject();
-                        //return;
-                    }
-                    if (key.indexOf("Timestamp") === -1) {
+                    if (!key.includes("Timestamp")) {
                         body[key] = chargingStates[keyName];
                     }
                 });
-                this.config.pendingRequests = Math.max(this.config.pendingRequests - 1, 0);
+                this.config.pendingRequests = Math.max(
+                    this.config.pendingRequests - 1,
+                    0
+                );
             }
+
             let method = "POST";
             if (value === "settings" || action === "destinations") {
                 method = "PUT";
             }
 
-            let urlString = "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" + vin + "/" + action + "/" + value;
+            let urlString =
+                "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" +
+                vin +
+                "/" +
+                action +
+                "/" +
+                value;
             if (action === "destinations") {
-                urlString = "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" + vin + "/" + action;
+                urlString =
+                    "https://emea.bff.cariad.digital/vehicle/v1/vehicles/" +
+                    vin +
+                    "/" +
+                    action;
             }
-            this.log.debug(urlString);
 
-            this.log.debug("setIdRemote: " + JSON.stringify(body));
+            this.log.debug("setIdRemote URL: " + urlString);
+            this.log.debug("setIdRemote body: " + JSON.stringify(body));
+
             request(
                 {
-                    method: method,
+                    method,
                     url: urlString,
-
                     headers: {
                         "content-type": "application/json",
                         accept: "*/*",
@@ -1955,844 +1941,93 @@ class VwWeConnect {
                         "user-agent": this.userAgent,
                         "content-version": "1",
                         "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-                        authorization: "Bearer " + this.config.atoken,
+                        authorization: "Bearer " + this.config.atoken
                     },
-                    body: body,
+                    body,
                     followAllRedirects: true,
                     json: true,
-                    gzip: true,
+                    gzip: true
                 },
-                (err, resp, body) => {
+                (err, resp, bodyResp) => {
                     if (err || (resp && resp.statusCode >= 400)) {
                         if (resp && resp.statusCode === 401) {
-                            err && this.log.error(err);
-                            resp && this.log.error(resp.statusCode.toString());
-                            body && this.log.error(JSON.stringify(body));
-                            this.refreshIDToken().catch(() => { });
-                            this.log.error("Refresh Token");
-                            reject();
-                            return;
-                        }
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        body && this.log.error(JSON.stringify(body));
-                        reject();
-                        return;
-                    }
-                    try {
-                        this.log.debug(JSON.stringify(body));
-                        resolve();
-                    } catch (err) {
-                        this.log.error(err);
-                        reject();
-                    }
-                }
-            );
-        });
-    }
+                            this.log.warn(
+                                "[setIdRemote] 401 for " +
+                                action +
+                                "/" +
+                                value +
+                                (isRetry ? " after retry" : "")
+                            );
 
-    refreshIDToken() {
-        return new Promise((resolve, reject) => {
-            this.log.debug("Token Refresh started");
-            request.get(
-                {
-                    url: "https://emea.bff.cariad.digital/user-login/refresh/v1",
-
-                    headers: {
-                        accept: "*/*",
-                        "content-type": "application/json",
-                        "content-version": "1",
-                        "x-newrelic-id": "VgAEWV9QDRAEXFlRAAYPUA==",
-                        "user-agent": this.userAgent,
-                        "accept-language": "de-de",
-                        authorization: "Bearer " + this.config.rtoken,
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        body && this.log.error(JSON.stringify(body));
-                        this.log.error("Failed refresh token. Relogin");
-                        //reset login parameters because of wecharge
-                        this.type = "Id";
-                        this.clientId = "a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com";
-                        this.scope = "openid profile badge cars dealers birthdate vin";
-                        this.redirect = "weconnect://authenticated";
-                        this.xrequest = "com.volkswagen.weconnect";
-                        this.responseType = "code id_token token";
-                        setTimeout(() => {
-                            this.log.error("Restart adapter in 10min");
-                            this.restart();
-                        }, 10 * 60 * 1000);
-                        reject();
-                        return;
-                    }
-                    try {
-                        this.log.debug("Token Refresh successful");
-                        this.config.atoken = body.accessToken;
-                        this.config.rtoken = body.refreshToken;
-                        if (this.type === "Wc") {
-                            //wallcharging relogin no refresh token available
-                            this.login().catch(() => {
-                                this.log.debug("No able to Login in WeCharge");
-                            });
-                        }
-                        resolve();
-                    } catch (err) {
-                        this.log.error(err);
-                        reject();
-                    }
-                }
-            );
-        });
-    }
-
-    getVehicleData(vin) {
-        return new Promise((resolve, reject) => {
-
-            let accept = "application/vnd.vwg.mbb.vehicleDataDetail_v2_1_0+json, application/vnd.vwg.mbb.genericError_v1_0_2+json";
-            let url = this.replaceVarInUrl("$homeregion/fs-car/vehicleMgmt/vehicledata/v2/$type/$country/vehicles/$vin/", vin);
-
-            const atoken = this.config.vwatoken;
-
-            request.get(
-                {
-                    url: url,
-                    headers: {
-                        "User-Agent": this.userAgent,
-                        "X-App-Version": this.xappversion,
-                        "X-App-Name": this.xappname,
-                        "X-Market": "de_DE",
-                        Authorization: "Bearer " + atoken,
-                        "If-None-Match": this.etags[url] || "",
-                        Accept: accept,
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        if (resp && resp.statusCode === 429) {
-                            this.log.error("Too many requests. Please turn on your car to send new requests. Maybe force update/update erzwingen is too often.");
-                        }
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        body && this.log.error(JSON.stringify(body));
-                        reject();
-                        return;
-                    }
-                    try {
-                        this.log.debug(JSON.stringify(body));
-                        let result = body.vehicleData;
-                        if (!result) {
-                            result = body.vehicleDataDetail;
-                        }
-                        if (resp) {
-                            this.etags[url] = resp.headers.etag;
-                            if (resp.statusCode === 304) {
-                                this.log.debug("304 No values updated");
-                                resolve();
+                            if (isRetry) {
+                                this.log.error("[setIdRemote] 401 after relogin → giving up");
+                                err && this.log.error(err);
+                                bodyResp &&
+                                    this.log.error(JSON.stringify(bodyResp));
+                                reject(err || new Error("401 after retry"));
                                 return;
                             }
-                        }
-                        if (result && result.carportData && result.carportData.modelName) {
-                            this.updateName(vin, result.carportData.modelName);
-                        }
 
-                        resolve();
-                    } catch (err) {
-                        this.log.error(err);
-                        reject();
-                    }
-                }
-            );
-        });
-    }
-
-    getVehicleRights(vin) {
-        return new Promise((resolve, reject) => {
-            if (!this.config.rights) {
-                resolve();
-                return;
-            }
-            let url = "https://mal-1a.prd.ece.vwg-connect.com/api/rolesrights/operationlist/v3/vehicles/" + vin;
-
-            request.get(
-                {
-                    url: url,
-                    qs: {
-                        scope: "All",
-                    },
-                    headers: {
-                        "User-Agent": this.userAgent,
-                        "X-App-Version": this.xappversion,
-                        "X-App-Name": this.xappname,
-                        Authorization: "Bearer " + this.config.vwatoken,
-                        Accept: "application/json, application/vnd.vwg.mbb.operationList_v3_0_2+xml, application/vnd.vwg.mbb.genericError_v1_0_2+xml",
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        if (resp && resp.statusCode === 429) {
-                            this.log.error("Too many requests. Please turn on your car to send new requests. Maybe force update/update erzwingen is too often.");
-                        }
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        reject();
-                        return;
-                    }
-                    try {
-                        const adapter = this;
-                        traverse(body.operationList).forEach(function (value) {
-                            if (this.path.length > 0 && this.isLeaf) {
-                                const modPath = this.path;
-                                this.path.forEach((pathElement, pathIndex) => {
-                                    if (!isNaN(parseInt(pathElement))) {
-                                        let stringPathIndex = parseInt(pathElement) + 1 + "";
-                                        while (stringPathIndex.length < 2) stringPathIndex = "0" + stringPathIndex;
-                                        const key = this.path[pathIndex - 1] + stringPathIndex;
-                                        const parentIndex = modPath.indexOf(pathElement) - 1;
-                                        modPath[parentIndex] = key;
-                                        modPath.splice(parentIndex + 1, 1);
-                                    }
+                            // één keer een full login en daarna retry
+                            this._loginOnceGuarded("setIdRemote 401")
+                                .then(() => {
+                                    this.setIdRemote(vin, action, value, bodyContent, true)
+                                        .then(resolve)
+                                        .catch(reject);
+                                })
+                                .catch((loginErr) => {
+                                    this.log.error(
+                                        "[setIdRemote] Login failed during 401 handling: " +
+                                        loginErr
+                                    );
+                                    reject(loginErr);
                                 });
-                                if (modPath[modPath.length - 1] !== "$") {
-                                    if (typeof value === "object") {
-                                        value = JSON.stringify(value);
-                                    }
-                                }
-                            }
-                        });
-
-                        resolve();
-                    } catch (err) {
-                        this.log.error(err);
-                        reject();
-                    }
-                }
-            );
-        });
-    }
-
-    requestStatusUpdate(vin) {
-        return new Promise((resolve, reject) => {
-            try {
-
-                let method = "POST";
-                let url = this.replaceVarInUrl("$homeregion/fs-car/bs/vsr/v1/$type/$country/vehicles/$vin/requests", vin);
-
-                let accept = "application/json";
-                // if (this.config.type === "audi") {
-                //     url = this.replaceVarInUrl("https://mal-3a.prd.eu.dp.vwg-connect.com/api/bs/vsr/v1/vehicles/$vin/requests", vin);
-                // }
-
-                this.log.debug("Request update " + url);
-                request(
-                    {
-                        method: method,
-                        url: url,
-                        headers: {
-                            "User-Agent": this.userAgent,
-                            "X-App-Version": this.xappversion,
-                            "X-App-Name": this.xappname,
-                            Authorization: "Bearer " + this.config.vwatoken,
-                            "Accept-charset": "UTF-8",
-                            Accept: accept,
-                        },
-                        followAllRedirects: true,
-                        gzip: true,
-                        json: true,
-                    },
-                    (err, resp, body) => {
-                        if (err || (resp && resp.statusCode >= 400)) {
-                            this.log.error(vin);
-                            if (resp && resp.statusCode === 429) {
-                                this.log.error("Too many requests. Please turn on your car to send new requests. Maybe force update/update erzwingen is too often.");
-                            }
-                            err && this.log.error(err);
-                            resp && this.log.error(resp.statusCode.toString());
-                            body && this.log.error(JSON.stringify(body));
-                            reject();
-                            return;
-                        }
-                        try {
-                            this.log.debug(JSON.stringify(body));
-                            resolve();
-                        } catch (err) {
-                            this.log.error("Request update failed: " + url);
-                            this.log.error(vin);
-                            this.log.error(err);
-                            reject();
-                        }
-                    }
-                );
-            } catch (err) {
-                this.log.error(err);
-                reject();
-            }
-        });
-    }
-
-    getVehicleStatus(vin, url, path, element, element2, element3, element4, tripType) {
-        return new Promise((resolve, reject) => {
-            url = this.replaceVarInUrl(url, vin, tripType);
-            if (path === "tripdata") {
-                if (this.tripsActive == false) {
-                    resolve();
-                    return;
-                }
-            }
-            let accept = "application/json";
-
-            request.get(
-                {
-                    url: url,
-                    headers: {
-                        "User-Agent": this.userAgent,
-                        "X-App-Version": this.xappversion,
-                        "X-App-Name": this.xappname,
-                        "If-None-Match": this.etags[url] || "",
-                        Authorization: "Bearer " + this.config.vwatoken,
-                        "Accept-charset": "UTF-8",
-                        Accept: accept,
-                    },
-                    followAllRedirects: true,
-                    gzip: true,
-                    json: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        if ((resp && resp.statusCode === 403) || (resp && resp.statusCode === 502) || (resp && resp.statusCode === 406) || (resp && resp.statusCode === 500)) {
-                            body && this.log.debug(JSON.stringify(body));
-                            resolve();
-                            return;
-                        } else if (resp && resp.statusCode === 401) {
-                            this.log.error(vin);
-                            err && this.log.error(err);
-                            resp && this.log.error(resp.statusCode.toString());
-                            body && this.log.error(JSON.stringify(body));
-                            this.log.error("Refresh Token in 10min");
-                            if (!this.refreshTokenTimeout) {
-                                this.refreshTokenTimeout = setTimeout(() => {
-                                    this.refreshTokenTimeout = null;
-                                    this.refreshToken(true).catch(() => {
-                                        this.log.error("Refresh Token was not successful");
-                                    });
-                                }, 10 * 60 * 1000);
-                            }
-                            reject();
-                            return;
-                        } else {
-                            if (resp && resp.statusCode === 429) {
-                                this.log.error("Too many requests. Please turn on your car to send new requests. Maybe force update/update erzwingen is too often.");
-                            }
-                            err && this.log.error(err);
-                            resp && this.log.error(resp.statusCode.toString());
-                            body && this.log.error(JSON.stringify(body));
-                            reject();
-                            return;
-                        }
-                    }
-                    try {
-                        this.log.debug("getVehicleStatus: " + JSON.stringify(body));
-                        if (resp) {
-                            this.etags[url] = resp.headers.etag;
-                            if (resp.statusCode === 304) {
-                                this.log.debug("304 No values updated");
-                                resolve();
-                                return;
-                            }
-                        }
-                        if (path === "position") {
-                            if (resp.statusCode === 204) {
-                                // moving true
-                                resolve();
-                                return;
-                            } else {
-                                // moving false
-                            }
-                            if (body && body.storedPositionResponse && body.storedPositionResponse.parkingTimeUTC) {
-                                body.storedPositionResponse.position.parkingTimeUTC = body.storedPositionResponse.parkingTimeUTC;
-                            }
-                        }
-
-                        if (body === undefined || body === "" || body.error) {
-                            if (body && body.error && body.error.description.indexOf("Token expired") !== -1) {
-                                this.log.error("Error response try to refresh token " + path);
-                                this.log.error(JSON.stringify(body));
-                                this.log.error("Refresh Token in 10min");
-                                if (!this.refreshTokenTimeout) {
-                                    this.refreshTokenTimeout = setTimeout(() => {
-                                        this.refreshTokenTimeout = null;
-                                        this.refreshToken(true).catch(() => {
-                                            this.log.error("Refresh Token was not successful");
-                                        });
-                                    }, 10 * 60 * 1000);
-                                }
-                            } else {
-                                this.log.debug("Not able to get " + path);
-                            }
-                            this.log.debug(body);
-                            reject();
                             return;
                         }
 
-                        const adapter = this;
-
-                        let result = body;
-                        if (result === "") {
-                            resolve();
-                            return;
-                        }
-                        if (result) {
-                            if (element && result[element]) {
-                                result = result[element];
-                            }
-                            if (element2 && result[element2]) {
-                                result = result[element2];
-                            }
-                            if (element3 && result[element3]) {
-                                result = result[element3];
-                            }
-                            if (element4 && result[element4]) {
-                                result = result[element4];
-                            }
-                            const isStatusData = path === "status";
-                            const isTripData = path === "tripdata";
-
-                            if (isTripData) {
-                                if (this.tripsActive == false) {
-                                    resolve();
-                                    return;
-                                }
-                                // result.tripData = result.tripData.reverse();
-                                result.tripData.sort((a, b) => {
-                                    return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
-                                });
-                                if (this.config.numberOfTrips > 0) result.tripData = result.tripData.slice(0, this.config.numberOfTrips);
-
-                                resolve();
-                                return;
-                            }
-
-                            var statusKeys = null;
-                            if (isStatusData) {
-                                statusKeys = this.getStatusKeys(result);
-                            }
-                            var tripKeys = null;
-                            if (isTripData) {
-                                tripKeys = this.getTripKeys(result);
-                            }
-                            traverse(result).forEach(function (value) {
-                                const modPath = this.path.slice();
-                                var dataId = null;
-                                var dataIndex = -1;
-                                var fieldId = null;
-                                var fieldUnit = null;
-                                var isNumberNode = false;
-                                var skipNode = false;
-                                this.path.forEach((pathElement, pathIndex) => {
-                                    if (isNaN(parseInt(pathElement))) {
-                                        isNumberNode = false;
-                                    } else {
-                                        isNumberNode = true;
-                                        var key;
-                                        if (isStatusData && this.path[pathIndex - 1] === "data") {
-                                            dataIndex = parseInt(pathElement);
-                                            dataId = statusKeys[dataIndex].dataId;
-                                            key = "_" + dataId;
-                                        } else if (isStatusData && this.path[pathIndex - 1] === "field") {
-                                            if (dataIndex >= 0) {
-                                                fieldId = statusKeys[dataIndex].fieldIds[parseInt(pathElement)].id;
-                                                key = "_" + fieldId;
-                                                if (this.key == "value" && statusKeys[dataIndex].fieldIds[parseInt(pathElement)].unit) {
-                                                    fieldUnit = statusKeys[dataIndex].fieldIds[parseInt(pathElement)].unit;
-                                                }
-                                            } else {
-                                                adapter.log.error("no data entry found for field (path = " + this.path.join("."));
-                                                key = parseInt(pathElement) + 1 + "";
-                                            }
-                                        } else if (isTripData && this.path[pathIndex - 1]) {
-                                            var tripKey = tripKeys[parseInt(pathElement)];
-                                            if (tripKey === null) {
-                                                skipNode = true;
-                                            } else {
-                                                key = "_" + tripKeys[parseInt(pathElement)];
-                                            }
-                                        } else {
-                                            key = parseInt(pathElement) + 1 + "";
-                                            while (key.length < 2) key = "0" + key;
-                                        }
-                                        if (!skipNode) {
-                                            const parentIndex = modPath.indexOf(pathElement) - 1;
-                                            modPath[parentIndex] = this.path[pathIndex - 1] + key;
-                                            modPath.splice(parentIndex + 1, 1);
-                                        }
-                                    }
-                                });
-                                if (!skipNode) {
-                                    const newPath = vin + "." + path + "." + modPath.join(".");
-                                    if (this.path.length > 0 && this.isLeaf) {
-                                        value = value || this.node;
-                                        if (!isNaN(Number(value)) && Number(value) === parseFloat(value)) {
-                                            value = Number(value);
-                                        }
-                                        if (typeof value === "object") {
-                                            value = JSON.stringify(value);
-                                        }
-                                        if (isStatusData && this.key == "value") {
-                                            if (dataId == "0x030104FFFF" && fieldId == "0x0301040001") {
-                                                // if (value == 2) { isCarLocked = true };
-                                            }
-                                            if (dataId == "0x030102FFFF" && fieldId == "0x0301020001") {
-                                                // outsideTemperature = Math.round(value - 2731.5) / 10.0
-                                            }
-                                            adapter.updateUnit(newPath, fieldUnit);
-                                        }
-                                    } else if (isStatusData && isNumberNode) {
-                                        var text = null;
-                                        if (this.node.textId) {
-                                            text = this.node.textId;
-                                        }
-                                        adapter.updateName(newPath, text);
-                                    } else if (isTripData && isNumberNode) {
-                                        var text = null;
-                                        if (this.node.timestamp) {
-                                            text = this.node.timestamp;
-                                        }
-                                        adapter.updateName(newPath, text);
-                                    }
-                                }
-                            });
-                            resolve();
-                        } else {
-                            this.log.error("Cannot find vehicle data " + path);
-                            this.log.error(JSON.stringify(body));
-                            reject();
-                        }
-                    } catch (err) {
-                        this.log.error(err);
-                        this.log.error(err.stack);
-                        reject();
-                    }
-                }
-            );
-        });
-    }
-
-    getStatusKeys(statusJson) {
-        const adapter = this;
-        var result = null;
-        if (statusJson && statusJson.data) {
-            if (Array.isArray(statusJson.data)) {
-                result = new Array(statusJson.data.length);
-                statusJson.data.forEach(function (dataValue, dataIndex) {
-                    if (dataValue && dataValue.id) {
-                        if (dataValue.field && Array.isArray(dataValue.field)) {
-                            var newList = new Array(dataValue.field.length);
-                            dataValue.field.forEach(function (fieldValue, fieldIndex) {
-                                if (fieldValue && fieldValue.id) {
-                                    newList[fieldIndex] = { id: fieldValue.id, unit: fieldValue.unit };
-                                } else {
-                                    adapter.log.warn("status[" + dataIndex + "," + fieldIndex + "] has no id");
-                                    adapter.log.debug(JSON.stringify(fieldValue));
-                                }
-                            });
-                            result[dataIndex] = { dataId: dataValue.id, fieldIds: newList };
-                        } else {
-                            adapter.log.warn("status[" + dataIndex + "] has no fields/is not an array");
-                            adapter.log.debug(JSON.stringify(dataValue));
-                        }
-                    } else {
-                        adapter.log.warn("status[" + dataIndex + "] has no id");
-                        adapter.log.debug(JSON.stringify(dataValue));
-                    }
-                });
-            } else {
-                adapter.log.warn("status is not an array");
-                adapter.log.debug(JSON.stringify(statusJson.data));
-            }
-        } else {
-            adapter.log.warn("status data without status field");
-            adapter.log.debug(JSON.stringify(statusJson));
-        }
-        adapter.log.debug(JSON.stringify(result));
-        return result;
-    }
-
-    updateUnit(pathString, unit) {
-        const adapter = this;
-        this.getObject(pathString, function (err, obj) {
-            if (err) adapter.log.error('Error "' + err + '" reading object ' + pathString + " for unit");
-            else {
-                if (obj && obj.common && obj.common.unit !== unit) {
-                    adapter.extendObject(pathString, {
-                        type: "state",
-                        common: {
-                            unit: unit,
-                        },
-                    });
-                }
-            }
-        });
-    }
-
-    updateName(pathString, name) {
-        const adapter = this;
-        this.getObject(pathString, function (err, obj) {
-            if (err) adapter.log.error('Error "' + err + '" reading object ' + pathString + " for name");
-            else {
-                if (obj && obj.common && obj.common.name !== name) {
-                    adapter.extendObject(pathString, {
-                        type: "channel",
-                        common: {
-                            name: name,
-                        },
-                    });
-                }
-            }
-        });
-    }
-
-    setVehicleStatus(vin, url, body, contentType, secToken) {
-        return new Promise((resolve, reject) => {
-            url = this.replaceVarInUrl(url, vin);
-            this.log.debug(body);
-            this.log.debug(contentType);
-            const headers = {
-                "User-Agent": this.userAgent,
-                "X-App-Version": this.xappversion,
-                "X-App-Name": this.xappname,
-                Authorization: "Bearer " + this.config.vwatoken,
-                "Accept-charset": "UTF-8",
-                "Content-Type": contentType,
-                Accept:
-                    "application/json, application/vnd.vwg.mbb.ChargerAction_v1_0_0+xml,application/vnd.volkswagenag.com-error-v1+xml,application/vnd.vwg.mbb.genericError_v1_0_2+xml, application/vnd.vwg.mbb.RemoteStandheizung_v2_0_0+xml, application/vnd.vwg.mbb.genericError_v1_0_2+xml,application/vnd.vwg.mbb.RemoteLockUnlock_v1_0_0+xml,*/*",
-            };
-            if (secToken) {
-                headers["x-mbbSecToken"] = secToken;
-            }
-
-            request.post(
-                {
-                    url: url,
-                    headers: headers,
-                    body: body,
-                    followAllRedirects: true,
-                    gzip: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
                         err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        body && this.log.error(body);
-                        reject();
+                        resp &&
+                            this.log.error(resp.statusCode.toString());
+                        bodyResp &&
+                            this.log.error(JSON.stringify(bodyResp));
+                        reject(err || new Error("setIdRemote failed"));
                         return;
                     }
+
                     try {
-                        this.log.debug(JSON.stringify(body));
-                        if (body.indexOf("<error>") !== -1) {
-                            this.log.error("Error response try to refresh token " + url);
-                            this.log.error(JSON.stringify(body));
-                            this.refreshToken(true).catch(() => {
-                                this.log.error("Refresh Token was not successful");
-                            });
-                            reject();
-                            return;
-                        }
+                        this.log.debug("setIdRemote response: " + JSON.stringify(bodyResp));
                         resolve();
-                        this.log.info(body);
-                    } catch (err) {
-                        this.log.error(err);
-                        this.log.error(err.stack);
-                        reject();
+                    } catch (e) {
+                        this.log.error(e);
+                        reject(e);
                     }
                 }
             );
         });
     }
 
-    setVehicleStatusv2(vin, url, body, contentType, secToken) {
-        return new Promise((resolve, reject) => {
-            url = this.replaceVarInUrl(url, vin);
-            this.log.debug(JSON.stringify(body));
-            this.log.debug(contentType);
-            const headers = {
-                "User-Agent": this.userAgent,
-                "X-App-Version": this.xappversion,
-                "X-App-Name": this.xappname,
-                Authorization: "Bearer " + this.config.vwatoken,
-                "Accept-charset": "UTF-8",
-                "Content-Type": contentType,
-                Accept:
-                    "application/json, application/vnd.vwg.mbb.ChargerAction_v1_0_0+xml,application/vnd.volkswagenag.com-error-v1+xml,application/vnd.vwg.mbb.genericError_v1_0_2+xml, application/vnd.vwg.mbb.RemoteStandheizung_v2_0_0+xml, application/vnd.vwg.mbb.genericError_v1_0_2+xml,application/vnd.vwg.mbb.RemoteLockUnlock_v1_0_0+xml,*/*",
-            };
-            if (secToken) {
-                headers["x-mbbSecToken"] = secToken;
-            }
+    hasParkingPosition(vin) {
+        const list = Array.isArray(this.vehicles)
+            ? this.vehicles
+            : this.vehicles && Array.isArray(this.vehicles.data)
+                ? this.vehicles.data
+                : [];
+        if (!Array.isArray(list)) return false;
 
-            request.post(
-                {
-                    url: url,
-                    headers: headers,
-                    body: body,
-                    followAllRedirects: true,
-                    gzip: true,
-                },
-                (err, resp, body) => {
-                    if (err || (resp && resp.statusCode >= 400)) {
-                        err && this.log.error(err);
-                        resp && this.log.error(resp.statusCode.toString());
-                        reject();
-                        return;
-                    }
-                    try {
-                        this.log.debug(JSON.stringify(body));
-                        if (body.indexOf("<error>") !== -1) {
-                            this.log.error("Error response try to refresh token " + url);
-                            this.log.error(JSON.stringify(body));
-                            this.refreshToken(true).catch(() => {
-                                this.log.error("Refresh Token was not successful");
-                            });
-                            reject();
-                            return;
-                        }
-                        this.log.info(body);
-                    } catch (err) {
-                        this.log.error(err);
-                        this.log.error(err.stack);
-                        reject();
-                    }
-                }
-            );
-        });
+        const vehicle = list.find((v) => v && v.vin === vin);
+        if (!vehicle || !Array.isArray(vehicle.capabilities)) return false;
+
+        return vehicle.capabilities.some(
+            (c) => c && c.id === "parkingPosition"
+        );
     }
 
-    getCodeChallenge() {
-        let hash = "";
-        let result = "";
-        const chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        result = "";
-        for (let i = 64; i > 0; --i) result += chars[Math.floor(Math.random() * chars.length)];
-        result = Buffer.from(result).toString("base64");
-        result = result.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-        hash = crypto.createHash("sha256").update(result).digest("base64");
-        hash = hash.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-
-        return [result, hash];
-    }
-
-    getCodeChallengev2() {
-        let hash = "";
-        let result = "";
-        const chars = "0123456789abcdef";
-        result = "";
-        for (let i = 64; i > 0; --i) result += chars[Math.floor(Math.random() * chars.length)];
-        hash = crypto.createHash("sha256").update(result).digest("base64");
-        hash = hash.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
-
-        return [result, hash];
-    }
-
-    getNonce() {
-        const timestamp = Date.now();
-        let hash = crypto.createHash("sha256").update(timestamp.toString()).digest("base64");
-        hash = hash.slice(0, hash.length - 1);
-        return hash;
-    }
-
-    toHexString(byteArray) {
-        return Array.prototype.map
-            .call(byteArray, function (byte) {
-                return ("0" + (byte & 0xff).toString(16).toUpperCase()).slice(-2);
-            })
-            .join("");
-    }
-
-    toByteArray(hexString) {
-        const result = [];
-        for (let i = 0; i < hexString.length; i += 2) {
-            result.push(parseInt(hexString.substr(i, 2), 16));
-        }
-        return result;
-    }
-
-    stringIsAValidUrl(s) {
-        try {
-            new URL(s);
-            return true;
-        } catch (err) {
-            return false;
-        }
-    }
-
-    randomString(length) {
-        let result = "";
-        const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        const charactersLength = characters.length;
-        for (let i = 0; i < length; i++) {
-            result += characters.charAt(Math.floor(Math.random() * charactersLength));
-        }
-        return result;
-    }
-
-    toCammelCase(string) {
-        return string.replace(/-([a-z])/g, function (g) {
-            return g[1].toUpperCase();
-        });
-    }
-
-    extractHidden(body) {
-        const returnObject = {};
-        let matches;
-        if (body.matchAll) {
-            matches = body.matchAll(/<input (?=[^>]* name=["']([^'"]*)|)(?=[^>]* value=["']([^'"]*)|)/g);
-        } else {
-            this.log.warn("The adapter needs in the future NodeJS v12. https://forum.iobroker.net/topic/22867/how-to-node-js-f%C3%BCr-iobroker-richtig-updaten");
-            matches = this.matchAll(/<input (?=[^>]* name=["']([^'"]*)|)(?=[^>]* value=["']([^'"]*)|)/g, body);
-        }
-        for (const match of matches) {
-            returnObject[match[1]] = match[2];
-        }
-        return returnObject;
-    }
-
-    matchAll(re, str) {
-        let match;
-        const matches = [];
-
-        while ((match = re.exec(str))) {
-            // add all matched groups
-            matches.push(match);
-        }
-
-        return matches;
-    }
-
-    /**
-     * Is called when adapter shuts down - callback has to be called under any circumstances!
-     * @param {() => void} callback
-     */
-    onUnload(/*callback*/) {
+    onUnload() {
         try {
             this.log.debug("cleaned everything up...");
-            clearInterval(this.refreshTokenInterval);
-            clearInterval(this.vwrefreshTokenInterval);
             clearInterval(this.updateInterval);
-            clearInterval(this.fupdateInterval);
-            clearTimeout(this.refreshTokenTimeout);
-            //callback();
             this.log.debug("onUnload: Success");
         } catch (e) {
-            //callback();
             this.log.error("onUnload: Error");
         }
     }
