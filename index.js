@@ -566,17 +566,17 @@ class VwWeConnect {
 
         try {
             await this.login();
-            this.log.debug("Login successful");
+            this.log.info("Login successful");
 
             await this.getPersonalData();
             await this.getVehicles();
 
             this.vinArray.forEach((vin) => {
                 this.getIdStatus(vin).catch(() => {
-                    this.log.error("get id status Failed");
+                    this.log.debug("get id status Failed");
                 });
                 this.getIdParkingPosition(vin).catch(() => {
-                    this.log.error("get id parking position Failed");
+                    this.log.debug("get id parking position Failed");
                 });
             });
 
@@ -700,7 +700,7 @@ class VwWeConnect {
         while (maxInitialRedirects > 0) {
             // If we already got a custom scheme, just return it
             if (url.startsWith("weconnect://")) {
-                adapter.log.info("[_handleNewAuthFlow] Found custom scheme during initial fetch: " + url);
+                adapter.log.debug("[_handleNewAuthFlow] Found custom scheme during initial fetch: " + url);
                 return url;
             }
 
@@ -793,7 +793,7 @@ class VwWeConnect {
 
             // Final callbacks
             if (redirectUrl.startsWith("weconnect://authenticated")) {
-                adapter.log.info("[_handleNewAuthFlow] Reached OAuth callback URL");
+                adapter.log.debug("[_handleNewAuthFlow] Reached OAuth callback URL");
                 return redirectUrl;
             }
             if (redirectUrl.startsWith("weconnect://")) {
@@ -803,7 +803,7 @@ class VwWeConnect {
 
             // Handle consent / terms-and-conditions pages (like Python)
             if (redirectUrl.indexOf("terms-and-conditions") !== -1) {
-                adapter.log.info("[_handleNewAuthFlow] Detected terms-and-conditions page");
+                adapter.log.info("[_handleNewAuthFlow] Detected terms-and-conditions page at: " + redirectUrl);
                 redirectUrl = await this._handleConsentPage(
                     redirectUrl.startsWith("http")
                         ? redirectUrl
@@ -854,7 +854,7 @@ class VwWeConnect {
 
             // Check again for final callbacks before next iteration
             if (redirectUrl.startsWith("weconnect://authenticated")) {
-                adapter.log.info("[_handleNewAuthFlow] Reached OAuth callback URL after redirect");
+                adapter.log.debug("[_handleNewAuthFlow] Reached OAuth callback URL after redirect");
                 return redirectUrl;
             }
             if (redirectUrl.startsWith("weconnect://")) {
@@ -1054,7 +1054,7 @@ class VwWeConnect {
         this.config.rtoken = refreshToken;
         this.config.idtoken = idToken;
 
-        this.log.info("Login successful");
+        this.log.debug("login successful");
         return true;
     }
 
@@ -1071,9 +1071,9 @@ class VwWeConnect {
         this.isLoggingIn = true;
         this.loginPromise = (async () => {
             try {
-                this.log.info("[LoginGuard] Starting full login (" + reason + ")");
+                this.log.debug("[LoginGuard] Starting full login (" + reason + ")");
                 await this.login();
-                this.log.info("[LoginGuard] Login completed (" + reason + ")");
+                this.log.debug("(Re-)login completed (" + reason + ")");
             } catch (e) {
                 this.log.error("[LoginGuard] Login failed (" + reason + "): " + e);
                 throw e;
@@ -1092,10 +1092,10 @@ class VwWeConnect {
         this.vinArray.forEach((vin) => {
             if (vin === this.currSession.vin) {
                 this.getIdStatus(vin).catch((err) => {
-                    this.log.error("get id status Failed: " + err);
+                    this.log.debug("get id status Failed: " + err);
                 });
                 this.getIdParkingPosition(vin).catch((err) => {
-                    this.log.error("get id parking position Failed: " + err);
+                    this.log.debug("get id parking position Failed: " + err);
                 });
             }
         });
@@ -1665,26 +1665,26 @@ class VwWeConnect {
             let { resp, body } = await callOnce();
 
             if (resp.statusCode === 401) {
-                this.log.warn("[IDStatus] 401 → performing full login()");
+                this.log.debug("[IDStatus] 401 → performing full login()");
                 await this._loginOnceGuarded("getIdStatus 401");
 
                 // tweede poging na login
                 ({ resp, body } = await callOnce());
 
                 if (resp.statusCode === 401) {
-                    this.log.error("[IDStatus] 401 again after relogin → giving up");
+                    this.log.debug("[IDStatus] 401 again after relogin → giving up");
                     throw new Error("auth-failed");
                 }
             }
 
             if (resp.statusCode >= 400) {
-                this.log.error("[IDStatus] HTTP " + resp.statusCode);
-                this.log.error("[IDStatus] Body: " + JSON.stringify(body));
+                this.log.debug("[IDStatus] HTTP " + resp.statusCode);
+                this.log.debug("[IDStatus] Body: " + JSON.stringify(body));
                 throw new Error("getIdStatus HTTP " + resp.statusCode);
             }
 
             if (typeof body !== "object" || body === null) {
-                this.log.error("[IDStatus] Invalid JSON body");
+                this.log.debug("[IDStatus] Invalid JSON body");
                 throw new Error("invalid-json");
             }
 
@@ -1704,7 +1704,7 @@ class VwWeConnect {
 
             this.log.debug("[IDStatus] Success for VIN " + vin);
         } catch (err) {
-            this.log.error("[IDStatus] Error: " + err);
+            this.log.debug("[IDStatus] Error: " + err);
             throw err;
         }
     }
@@ -1751,26 +1751,26 @@ class VwWeConnect {
             let { resp, body } = await callOnce();
 
             if (resp.statusCode === 401) {
-                this.log.warn("[Parking] 401 → performing full login()");
+                this.log.debug("[Parking] 401 → performing full login()");
                 await this._loginOnceGuarded("getIdParkingPosition 401");
 
                 // tweede poging na login
                 ({ resp, body } = await callOnce());
 
                 if (resp.statusCode === 401) {
-                    this.log.error("[Parking] 401 again after relogin → giving up");
+                    this.log.debug("[Parking] 401 again after relogin → giving up");
                     throw new Error("auth-failed");
                 }
             }
 
             if (resp.statusCode >= 400) {
-                this.log.error("[Parking] HTTP " + resp.statusCode);
-                this.log.error("[Parking] Body: " + JSON.stringify(body));
+                this.log.debug("[Parking] HTTP " + resp.statusCode);
+                this.log.debug("[Parking] Body: " + JSON.stringify(body));
                 throw new Error("getIdParkingPosition HTTP " + resp.statusCode);
             }
 
             if (!body) {
-                this.log.error("[Parking] Empty body");
+                this.log.debug("[Parking] Empty body");
                 this.idParkingPosition = { data: { carIsParked: false } };
                 return;
             }
@@ -1783,7 +1783,7 @@ class VwWeConnect {
 
             this.log.debug("[Parking] Success for VIN " + vin);
         } catch (err) {
-            this.log.error("[Parking] Error: " + err);
+            this.log.debug("[Parking] Error: " + err);
             throw err;
         }
     }
