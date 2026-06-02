@@ -1,4 +1,8 @@
 # npm-vwconnectidapi
+
+# Discontinued: Volkswagen has disabled authentication for non-official apps. This plugin no longer works.
+
+
 NPM package for a We Connect ID API based on https://github.com/TA2k/ioBroker.vw-connect  
 and https://github.com/nightsha-de/npm-vwconnectapi
 
